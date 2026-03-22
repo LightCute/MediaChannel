@@ -1,3 +1,6 @@
 [submodule "third_party/libdatachannel"]
 	path = third_party/libdatachannel
 	url = git@github.com:paullouisageneau/libdatachannel.git
+[submodule "third_party/spdlog"]
+	path = third_party/spdlog
+	url = git@github.com:gabime/spdlog.git
