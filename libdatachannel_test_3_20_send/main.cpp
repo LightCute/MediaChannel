@@ -3,7 +3,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
-
+#include <unistd.h>
 // 跨平台非阻塞输入检查（简化版）
 bool hasInput() {
 #ifdef _WIN32

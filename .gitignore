@@ -1,0 +1,20 @@
+build/
+cmake-build-*/  # 常见的CMake构建目录变体
+*.o             # 编译生成的目标文件
+*.a             # 静态库
+*.so            # 动态库
+*.exe           # 可执行文件
+CMakeCache.txt  # CMake缓存文件
+CMakeFiles/     # CMake临时文件
+Makefile        # Make生成的文件
+# 忽略所有日志文件
+*.log
+logs/
+log/
+*.log.*
+# 忽略本地数据库文件
+*.db
+*.sqlite
+*.sqlite3
+leveldb/
+rocksdb/
