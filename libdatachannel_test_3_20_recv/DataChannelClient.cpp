@@ -18,8 +18,14 @@ DataChannelClient::DataChannelClient()
     m_localId = randomId(4);
     Log::info("[DataChannelClient] Local ID generated: {}", m_localId);
     m_config.iceServers.emplace_back("stun:stun.l.google.com:19302");
-    m_config.iceServers.emplace_back("turn:120.79.210.6:3478?transport=udp");
-    m_config.iceServers.emplace_back("turn:120.79.210.6:3478?transport=tcp");
+    rtc::IceServer turnServer(
+        "120.79.210.6",  // hostname
+        3478,              // port
+        "light",           // username
+        "123456"           // password
+        // RelayType 默认是 TurnUdp，可不传
+    );
+    m_config.iceServers.emplace_back(turnServer);
 }
 
 DataChannelClient::~DataChannelClient() {
