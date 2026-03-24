@@ -14,19 +14,18 @@ DataChannelClient::DataChannelClient()
 {
     Log::init("app.log", Log::Mode::Async, spdlog::level::trace);
     Log::info("[DataChannelClient] Starting, thread id: [{}]", Log::threadIdToString(std::this_thread::get_id()));
-    rtc::InitLogger(rtc::LogLevel::Debug, myCppLogCallback);
+    rtc::InitLogger(rtc::LogLevel::Verbose, myCppLogCallback);
     m_localId = randomId(4);
     Log::info("[DataChannelClient] Local ID generated: {}", m_localId);
     m_config.iceServers.emplace_back("stun:stun.l.google.com:19302");
     rtc::IceServer turnServer(
-        "120.79.210.6",  // hostname
-        3478,              // port
-        "light",           // username
-        "123456"           // password
-        // RelayType 默认是 TurnUdp，可不传
+        "120.79.210.6",          // 纯IP，不带任何协议
+        3478,                     // 端口
+        "test",                   // 用户名（和网页一致）
+        "123",                    // 密码（和网页一致）
+        rtc::IceServer::RelayType::TurnUdp  // 强制UDP，去掉 ?transport=udp
     );
-    m_config.iceServers.emplace_back(turnServer);
-}
+    m_config.iceServers.push_back(turnServer);}
 
 DataChannelClient::~DataChannelClient() {
     close();
