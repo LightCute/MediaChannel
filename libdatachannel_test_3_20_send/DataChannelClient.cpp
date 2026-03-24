@@ -454,7 +454,7 @@ void DataChannelClient::startStream() {
             return;
         }
     } else {
-        stream = createStream("../samples/h264", 30, "../samples/opus");
+        stream = createStream("../../samples/h264", 30, "../../samples/opus");
         m_avStream = stream;
     }
     stream->start();
