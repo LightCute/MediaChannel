@@ -14,7 +14,7 @@ DataChannelClient::DataChannelClient()
 {
     Log::init("app.log", Log::Mode::Async, spdlog::level::trace);
     Log::info("[DataChannelClient] Starting, thread id: [{}]", Log::threadIdToString(std::this_thread::get_id()));
-    rtc::InitLogger(rtc::LogLevel::Verbose, myCppLogCallback);
+    rtc::InitLogger(rtc::LogLevel::Debug, myCppLogCallback);
     m_localId = randomId(4);
     Log::info("[DataChannelClient] Local ID generated: {}", m_localId);
     m_config.iceServers.emplace_back("stun:stun.l.google.com:19302");
