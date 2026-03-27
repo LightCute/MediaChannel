@@ -110,8 +110,6 @@ void DataChannelClient::callPeer(const std::string& peerId) {
     Log::info("[DataChannelClient] Offering to {}", peerId);
     auto pc = createPeerConnection(m_ws, peerId);
 
-    auto video = rtc::Description::Video("video-stream", rtc::Description::Direction::SendRecv);
-    auto track = pc->addTrack(video);
 
     const std::string label = "test";
     Log::info("[DataChannelClient] Creating DataChannel with label \"{}\"", label);
@@ -486,7 +484,7 @@ std::shared_ptr<ClientTrackData> DataChannelClient::addVideo(const std::shared_p
     // create RTP configuration
     auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, cname, payloadType, rtc::H264RtpPacketizer::ClockRate);
     // create packetizer
-    auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::Length, rtpConfig);
+    auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, rtpConfig);
     // add RTCP SR handler
     auto srReporter = std::make_shared<rtc::RtcpSrReporter>(rtpConfig);
     packetizer->addToChain(srReporter);

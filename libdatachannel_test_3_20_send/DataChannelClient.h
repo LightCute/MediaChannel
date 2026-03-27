@@ -13,6 +13,8 @@
 #include "utilities/log.h"
 #include "h264fileparser.hpp"
 #include "helpers.hpp"
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
 class DataChannelClient {
 public:
     using OnConnectedCallback = std::function<void(const std::string& peerId)>;
@@ -91,4 +93,16 @@ private:
     std::unordered_map<std::string, std::shared_ptr<Client>> m_clients;
     std::optional<std::shared_ptr<Stream>> m_avStream;
     DispatchQueue m_MainThread;
+
+
+    // --- GStreamer 桥接层 ---
+    void startGStreamerPipeline(std::optional<std::shared_ptr<ClientTrackData>> videoTrack);
+    void stopGStreamerPipeline();
+    static GstFlowReturn onNewSample(GstAppSink* sink, gpointer user_data);
+    // --- GStreamer 成员变量 ---
+    GstElement* m_gstPipeline = nullptr;
+    GstElement* m_gstAppSink = nullptr;
+    std::shared_ptr<ClientTrackData> m_currentVideoTrack;
+    uint64_t m_firstPts = 0;
+    std::atomic<bool> m_gstRunning{false};
 };

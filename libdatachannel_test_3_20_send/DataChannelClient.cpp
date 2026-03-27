@@ -5,8 +5,7 @@
 #include <stdexcept>
 #include <thread>
 #include "opusfileparser.hpp"
-#include <gst/gst.h>
-#include <gst/app/gstappsink.h>
+
 
 using namespace std::chrono_literals;
 using nlohmann::json;
@@ -28,6 +27,7 @@ DataChannelClient::DataChannelClient()
         rtc::IceServer::RelayType::TurnUdp  // 强制UDP，去掉 ?transport=udp
     );
     m_config.iceServers.push_back(turnServer);
+    gst_init(nullptr, nullptr);
 }
 
 DataChannelClient::~DataChannelClient() {
@@ -123,25 +123,23 @@ void DataChannelClient::callPeer(const std::string& peerId) {
     uint32_t videoSsrc = generateUniqueSSRC(peerId + "_video");
     uint32_t audioSsrc = generateUniqueSSRC(peerId + "_audio");
 
+    auto videoTrackData = addVideo(pc, 102, videoSsrc, "video-stream", "stream-" + peerId, nullptr);
     
-    auto videoTrackData = addVideo(pc, 102, videoSsrc, "video-stream", "stream-" + peerId, 
-    [this, peerId, wc = make_weak_ptr(client)]() {
-        m_MainThread.dispatch([this, wc, peerId]() {
-            if (auto c = wc.lock()) {
-                addToStream(c, true); // 复用 Example 的状态管理
-            }
-        });
-        Log::info("[DataChannelClient] Video track for {} is open", peerId);
-    });
+    client->video = videoTrackData;
 
-    client->audio = addAudio(pc, 111, audioSsrc, "audio-stream", "stream-" + peerId, [this, peerId, wc = make_weak_ptr(client)]() {
-        m_MainThread.dispatch([this, wc, peerId]() {
-            if (auto c = wc.lock()) {
-                addToStream(c, false);
-            }
-        });
-        Log::info("[DataChannelClient] Audio track for {} is open", peerId);
+    videoTrackData->track->onOpen([this, peerId, client]() {
+        Log::info("[DataChannelClient] Video track open for {}, starting GStreamer", peerId);
+        // ✅ 现在client->video 100%有值，传给GST
+        startGStreamerPipeline(client->video); 
     });
+    // client->audio = addAudio(pc, 111, audioSsrc, "audio-stream", "stream-" + peerId, [this, peerId, wc = make_weak_ptr(client)]() {
+    //     m_MainThread.dispatch([this, wc, peerId]() {
+    //         if (auto c = wc.lock()) {
+    //             addToStream(c, false);
+    //         }
+    //     });
+    //     Log::info("[DataChannelClient] Audio track for {} is open", peerId);
+    // });
 
     const std::string label = "test";
     Log::info("[DataChannelClient] Creating DataChannel with label \"{}\"", label);
@@ -176,7 +174,6 @@ void DataChannelClient::callPeer(const std::string& peerId) {
     });
 
     {
-        client->video = videoTrackData;
         client->dataChannel = dc;
     }
 }
@@ -204,6 +201,8 @@ void DataChannelClient::sendMessage(const std::string& peerId, const std::string
 
 void DataChannelClient::close() {
     Log::info("[DataChannelClient] Cleaning up...");
+    stopGStreamerPipeline(); // 先停媒体
+    
     for (auto& [id, client] : m_clients) {
         if (client->dataChannel.has_value() && client->dataChannel.value()) {
             client->dataChannel.value()->close();
@@ -214,10 +213,7 @@ void DataChannelClient::close() {
     }
     m_clients.clear();
     m_connectedFlag = false;
-    if (m_ws) {
-        m_ws->close();
-        m_ws.reset();
-    }
+    if (m_ws) { m_ws->close(); m_ws.reset(); }
 }
 
 std::string DataChannelClient::getLocalId() const {
@@ -430,7 +426,7 @@ std::shared_ptr<ClientTrackData> DataChannelClient::addVideo(const std::shared_p
     // create RTP configuration
     auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, cname, payloadType, rtc::H264RtpPacketizer::ClockRate);
     // create packetizer
-    auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::Length, rtpConfig);
+    auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, rtpConfig);
     // add RTCP SR handler
     auto srReporter = std::make_shared<rtc::RtcpSrReporter>(rtpConfig);
     packetizer->addToChain(srReporter);
@@ -635,4 +631,243 @@ std::shared_ptr<ClientTrackData> DataChannelClient::addAudio(const std::shared_p
     track->onOpen(onOpen);
     auto trackData = std::make_shared<ClientTrackData>(track, srReporter);
     return trackData;
+}
+//---------------GStreamer--------------------------
+// 前置声明：探针回调函数
+static GstPadProbeReturn H264DataProbe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data);
+
+// --- 启动 Linux GStreamer 实时采集 Pipeline ---
+void DataChannelClient::startGStreamerPipeline(std::optional<std::shared_ptr<ClientTrackData>> videoTrack) {
+    if (m_gstRunning.exchange(true)) {
+        Log::warn("[GStreamer] Pipeline already running");
+        return;
+    }
+
+    if (videoTrack.has_value()) {
+        // 2. 取出内部的 shared_ptr 直接赋值！
+        m_currentVideoTrack = videoTrack.value(); 
+    }    
+    m_firstPts = 0;
+
+    Log::info("[GStreamer] Creating pipeline...");
+
+    // ✅ 修复1：给关键元素命名 name=xxx （必须！）
+    // ✅ 修复2：简化管道，去掉JPEG解码（兼容性更强，绝大多数摄像头通用）
+    // const char* pipelineDesc = R"(
+    //     v4l2src device=/dev/video0 name=video_src ! 
+    //     video/x-raw,width=640,height=480,framerate=30/1 ! 
+    //     queue leaky=downstream max-size-buffers=1 ! 
+    //     x264enc name=h264_encoder tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 ! 
+    //     video/x-h264,stream-format=byte-stream,alignment=au ! 
+    //     appsink name=video_sink emit-signals=true sync=false
+    // )";
+
+    const char* pipelineDesc = R"(
+        v4l2src device=/dev/video0 name=video_src ! 
+        image/jpeg,width=640,height=480,framerate=30/1 ! 
+        jpegdec ! 
+        videoconvert ! 
+        queue leaky=downstream max-size-buffers=1 ! 
+        x264enc name=h264_encoder tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 ! 
+        video/x-h264,stream-format=byte-stream,alignment=au ! 
+        appsink name=video_sink emit-signals=true sync=false
+    )";
+
+    GError* error = nullptr;
+    m_gstPipeline = gst_parse_launch(pipelineDesc, &error);
+    if (error) {
+        Log::error("[GStreamer] Failed to parse pipeline: {}", error->message);
+        g_error_free(error);
+        m_gstRunning = false;
+        return;
+    }
+    Log::info("[GStreamer] Pipeline parsed successfully.");
+
+    // ==========================================
+    // ✅ 修复2：用正确的name获取元素（和pipeline里的name一致）
+    // ==========================================
+    GstElement* src = gst_bin_get_by_name(GST_BIN(m_gstPipeline), "video_src");
+    GstElement* encoder = gst_bin_get_by_name(GST_BIN(m_gstPipeline), "h264_encoder");
+    m_gstAppSink = gst_bin_get_by_name(GST_BIN(m_gstPipeline), "video_sink");
+
+    if (!src || !encoder || !m_gstAppSink) {
+        Log::error("[GStreamer] Failed to find elements! src={}, encoder={}, appsink={}", 
+                  (src!=nullptr), (encoder!=nullptr), (m_gstAppSink!=nullptr));
+        if (src) gst_object_unref(src);
+        if (encoder) gst_object_unref(encoder);
+        gst_object_unref(m_gstPipeline);
+        m_gstPipeline = nullptr;
+        m_gstRunning = false;
+        return;
+    }
+    Log::info("[GStreamer] All elements found (src, encoder, sink).");
+
+    // ==========================================
+    // 数据探针（监控编码器输出）
+    // ==========================================
+    GstPad* encoder_src_pad = gst_element_get_static_pad(encoder, "src");
+    if (encoder_src_pad) {
+        gst_pad_add_probe(encoder_src_pad, GST_PAD_PROBE_TYPE_BUFFER, 
+            H264DataProbe, this, nullptr);
+        gst_object_unref(encoder_src_pad);
+        Log::info("[GStreamer] Probe attached to encoder output.");
+    }
+
+    // ==========================================
+    // GStreamer 总线错误监听（核心调试日志）
+    // ==========================================
+    GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(m_gstPipeline));
+    gst_bus_add_watch(bus, [](GstBus* bus, GstMessage* msg, gpointer user_data) -> gboolean {
+        auto* self = static_cast<DataChannelClient*>(user_data);
+        switch (GST_MESSAGE_TYPE(msg)) {
+            case GST_MESSAGE_ERROR: {
+                GError* err;
+                gchar* debug;
+                gst_message_parse_error(msg, &err, &debug);
+                Log::error("[GStreamer] BUS ERROR: {} | Debug: {}", err->message, debug ? debug : "none");
+                g_error_free(err);
+                g_free(debug);
+                break;
+            }
+            case GST_MESSAGE_WARNING: {
+                GError* err;
+                gchar* debug;
+                gst_message_parse_warning(msg, &err, &debug);
+                Log::warn("[GStreamer] BUS WARNING: {}", err->message);
+                g_error_free(err);
+                g_free(debug);
+                break;
+            }
+            case GST_MESSAGE_EOS:
+                Log::info("[GStreamer] BUS: End of Stream");
+                break;
+            case GST_MESSAGE_STATE_CHANGED:
+                if (GST_MESSAGE_SRC(msg) == GST_OBJECT(self->m_gstPipeline)) {
+                    GstState old_s, new_s, pending;
+                    gst_message_parse_state_changed(msg, &old_s, &new_s, &pending);
+                    Log::info("[GStreamer] State: {} -> {}", 
+                              gst_element_state_get_name(old_s), gst_element_state_get_name(new_s));
+                }
+                break;
+            default:
+                break;
+        }
+        return TRUE;
+    }, this);
+    gst_object_unref(bus);
+
+    // ==========================================
+    // 配置 appsink 回调
+    // ==========================================
+    GstAppSinkCallbacks callbacks{};
+    callbacks.new_sample = onNewSample;
+    gst_app_sink_set_callbacks(GST_APP_SINK(m_gstAppSink), &callbacks, this, nullptr);
+    Log::info("[GStreamer] Appsink callback set.");
+
+    // ==========================================
+    // 启动管道
+    // ==========================================
+    GstStateChangeReturn ret = gst_element_set_state(m_gstPipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        Log::error("[GStreamer] Failed to start PLAYING state!");
+        gst_object_unref(src);
+        gst_object_unref(encoder);
+        gst_object_unref(m_gstAppSink);
+        gst_object_unref(m_gstPipeline);
+        m_gstPipeline = m_gstAppSink = nullptr;
+        m_gstRunning = false;
+        return;
+    }
+
+    // 释放临时引用
+    gst_object_unref(src);
+    gst_object_unref(encoder);
+
+    Log::info("[GStreamer] ✅ Pipeline STARTED SUCCESSFULLY! Waiting for camera data...");
+}
+
+// ==========================================
+// 探针回调：打印编码器数据（调试用）
+// ==========================================
+static GstPadProbeReturn H264DataProbe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
+        GstBuffer *buffer = gst_pad_probe_info_get_buffer(info);
+        if (buffer) {
+            // 打印：编码器正常输出H264数据
+            gsize size = gst_buffer_get_size(buffer);
+            g_print("[GStreamer] Probe: H264 Frame Size = %zu bytes\n", size);
+        }
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+// ==========================================
+// appsink 核心回调：获取H264数据发给WebRTC
+// ==========================================
+GstFlowReturn DataChannelClient::onNewSample(GstAppSink* sink, gpointer user_data) {
+    auto* self = static_cast<DataChannelClient*>(user_data);
+    
+    // 调试：证明回调触发
+    g_print("[GStreamer] onNewSample Triggered!\n");
+
+    if (!self->m_gstRunning || !self->m_currentVideoTrack) {
+        return GST_FLOW_OK;
+    }
+
+    // 取数据
+    GstSample* sample = gst_app_sink_pull_sample(sink);
+    if (!sample) return GST_FLOW_OK;
+    
+    GstBuffer* buffer = gst_sample_get_buffer(sample);
+    GstMapInfo map;
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    // 转WebRTC数据格式
+    rtc::binary frame(reinterpret_cast<std::byte*>(map.data), 
+                     reinterpret_cast<std::byte*>(map.data + map.size));
+
+    try {
+        auto& track = self->m_currentVideoTrack;
+        const uint32_t clock = track->sender->rtpConfig->clockRate;
+        const uint32_t ts_inc = clock / 30; // 30fps
+
+        // 时间戳管理
+        if (self->m_firstPts == 0) {
+            track->sender->rtpConfig->timestamp = track->sender->rtpConfig->startTimestamp;
+            self->m_firstPts = 1;
+        } else {
+            track->sender->rtpConfig->timestamp += ts_inc;
+        }
+
+        // 发送帧
+        track->track->sendFrame(frame, rtc::FrameInfo(track->sender->rtpConfig->timestamp));
+        g_print("[GStreamer] Sent Frame: %zu bytes\n", map.size);
+    } 
+    catch (const std::exception& e) {
+        Log::error("[GStreamer] Send Failed: {}", e.what());
+    }
+
+    // 释放资源
+    gst_buffer_unmap(buffer, &map);
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+
+// ==========================================
+// 停止管道
+// ==========================================
+void DataChannelClient::stopGStreamerPipeline() {
+    if (!m_gstRunning.exchange(false)) return;
+    Log::info("[GStreamer] Stopping...");
+
+    if (m_gstPipeline) {
+        gst_element_set_state(m_gstPipeline, GST_STATE_NULL);
+        gst_object_unref(m_gstPipeline);
+        m_gstPipeline = nullptr;
+    }
+    m_gstAppSink = nullptr;
+    m_currentVideoTrack.reset();
 }
