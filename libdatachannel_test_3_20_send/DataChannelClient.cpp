@@ -5,7 +5,8 @@
 #include <stdexcept>
 #include <thread>
 #include "opusfileparser.hpp"
-
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
 
 using namespace std::chrono_literals;
 using nlohmann::json;

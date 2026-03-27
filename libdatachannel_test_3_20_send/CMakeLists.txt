@@ -40,4 +40,5 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     datachannel          # 根目录libdatachannel导入的目标
     spdlog::spdlog       # 根目录spdlog导入的目标
     Threads::Threads     # 根目录find的线程库
+    GStreamer            # 根目录find的GStreamer全局目标
 )
