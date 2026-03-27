@@ -26,7 +26,7 @@ DataChannelClient::DataChannelClient()
         "123",                    // 密码（和网页一致）
         rtc::IceServer::RelayType::TurnUdp  // 强制UDP，去掉 ?transport=udp
     );
-    m_config.iceServers.push_back(turnServer);
+    //m_config.iceServers.push_back(turnServer);
     gst_init(nullptr, nullptr);
 }
 
@@ -449,148 +449,6 @@ std::shared_ptr<ClientTrackData> DataChannelClient::addVideo(const std::shared_p
 
 
 
-/// Start stream
-void DataChannelClient::startStream() {
-    std::shared_ptr<Stream> stream;
-    if (m_avStream.has_value()) {
-        stream = m_avStream.value();
-        if (stream->isRunning) {
-            // stream is already running
-            return;
-        }
-    } else {
-        stream = createStream("../../samples/h264", 30, "../../samples/opus");
-        m_avStream = stream;
-    }
-    stream->start();
-}
-
-/// Add client to stream
-/// @param client Client
-/// @param adding_video True if adding video
-void DataChannelClient::addToStream(std::shared_ptr<Client> client, bool isAddingVideo) {
-    if (client->getState() == Client::State::Waiting) {
-        client->setState(isAddingVideo ? Client::State::WaitingForAudio : Client::State::WaitingForVideo);
-    } else if ((client->getState() == Client::State::WaitingForAudio && !isAddingVideo)
-               || (client->getState() == Client::State::WaitingForVideo && isAddingVideo)) {
-
-        // Audio and video tracks are collected now
-        assert(client->video.has_value() && client->audio.has_value());
-        auto video = client->video.value();
-
-        if (m_avStream.has_value()) {
-            sendInitialNalus(m_avStream.value(), video);
-        }
-
-        client->setState(Client::State::Ready);
-    }
-    if (client->getState() == Client::State::Ready) {
-        startStream();
-    }
-}
-
-// void DataChannelClient::addToStream(std::shared_ptr<Client> client, bool isAddingVideo) {
-//     // -------------------------------------------------------------------------
-//     // ✅ 修改点1：只要是添加视频，就直接进入 Ready 状态
-//     // -------------------------------------------------------------------------
-//     if (isAddingVideo) {
-//         // 确保视频 Track 存在
-//         assert(client->video.has_value());
-//         auto video = client->video.value();
-
-//         // 发送关键帧（如果流已创建）
-//         if (m_avStream.has_value()) {
-//             sendInitialNalus(m_avStream.value(), video);
-//         }
-
-//         // 直接设置为 Ready 状态
-//         client->setState(Client::State::Ready);
-//         Log::info("[DataChannelClient] Video track added, state set to Ready (audio optional)");
-//     }
-
-//     // -------------------------------------------------------------------------
-//     // ✅ 修改点2：只要状态是 Ready，就启动流
-//     // -------------------------------------------------------------------------
-//     if (client->getState() == Client::State::Ready) {
-//         startStream();
-//     }
-// }
-
-
-/// Create stream
-std::shared_ptr<Stream> DataChannelClient::createStream(
-    const std::string h264Samples, 
-    const unsigned fps, 
-    const std::string opusSamples) {
-    // video source
-    auto video = std::make_shared<H264FileParser>(h264Samples, fps, true);
-    // audio source
-    auto audio = std::make_shared<OPUSFileParser>(opusSamples, true);
-
-    auto stream = std::make_shared<Stream>(video, audio);
-    // set callback responsible for sample sending
-    stream->onSample([this, ws = make_weak_ptr(stream)](Stream::StreamSourceType type, uint64_t sampleTime, rtc::binary sample) {
-        std::vector<ClientTrack> tracks{};
-        std::string streamType = type == Stream::StreamSourceType::Video ? "video" : "audio";
-        // get track for given type
-        std::function<std::optional<std::shared_ptr<ClientTrackData>> (std::shared_ptr<Client>)> getTrackData = [type](std::shared_ptr<Client> client) {
-            return type == Stream::StreamSourceType::Video ? client->video : client->audio;
-        };
-        // get all clients with Ready state
-        for(auto id_client: m_clients) {
-            auto id = id_client.first;
-            auto client = id_client.second;
-            auto optTrackData = getTrackData(client);
-            if (client->getState() == Client::State::Ready && optTrackData.has_value()) {
-                auto trackData = optTrackData.value();
-                tracks.push_back(ClientTrack(id, trackData));
-            }
-        }
-        if (!tracks.empty()) {
-            for (auto clientTrack: tracks) {
-                auto client = clientTrack.id;
-                auto trackData = clientTrack.trackData;
-
-                std::cout << "Sending " << streamType << " sample with size: " << std::to_string(sample.size()) << " to " << client << std::endl;
-                try {
-                    // send sample
-                    trackData->track->sendFrame(sample, std::chrono::duration<double, std::micro>(sampleTime));
-                } catch (const std::exception &e) {
-                    std::cerr << "Unable to send "<< streamType << " packet: " << e.what() << std::endl;
-                }
-            }
-        }
-        m_MainThread.dispatch([this,ws]() {
-            if (m_clients.empty()) {
-                // we have no clients, stop the stream
-                if (auto stream = ws.lock()) {
-                    stream->stop();
-                }
-            }
-        });
-    });
-    return stream;
-}
-
-
-/// Send previous key frame so browser can show something to user
-/// @param stream Stream
-/// @param video Video track data
-void DataChannelClient::sendInitialNalus(std::shared_ptr<Stream> stream, std::shared_ptr<ClientTrackData> video) {
-    auto h264 = dynamic_cast<H264FileParser *>(stream->video.get());
-    auto initialNalus = h264->initialNALUS();
-
-    // send previous NALU key frame so users don't have to wait to see stream works
-    if (!initialNalus.empty()) {
-        const double frameDuration_s = double(h264->getSampleDuration_us()) / (1000 * 1000);
-        const uint32_t frameTimestampDuration = video->sender->rtpConfig->secondsToTimestamp(frameDuration_s);
-        video->sender->rtpConfig->timestamp = video->sender->rtpConfig->startTimestamp - frameTimestampDuration * 2;
-        video->track->send(initialNalus);
-        video->sender->rtpConfig->timestamp += frameTimestampDuration;
-        // Send initial NAL units again to start stream in firefox browser
-        video->track->send(initialNalus);
-    }
-}
 
 
 uint32_t DataChannelClient::generateUniqueSSRC(const std::string& clientId) {
@@ -830,20 +688,21 @@ GstFlowReturn DataChannelClient::onNewSample(GstAppSink* sink, gpointer user_dat
                      reinterpret_cast<std::byte*>(map.data + map.size));
 
     try {
-        auto& track = self->m_currentVideoTrack;
-        const uint32_t clock = track->sender->rtpConfig->clockRate;
+        auto& trackData = self->m_currentVideoTrack;
+        const uint32_t clock = trackData->sender->rtpConfig->clockRate;
         const uint32_t ts_inc = clock / 30; // 30fps
 
         // 时间戳管理
         if (self->m_firstPts == 0) {
-            track->sender->rtpConfig->timestamp = track->sender->rtpConfig->startTimestamp;
+            trackData->sender->rtpConfig->timestamp = trackData->sender->rtpConfig->startTimestamp;
             self->m_firstPts = 1;
         } else {
-            track->sender->rtpConfig->timestamp += ts_inc;
+            trackData->sender->rtpConfig->timestamp += ts_inc;
         }
 
         // 发送帧
-        track->track->sendFrame(frame, rtc::FrameInfo(track->sender->rtpConfig->timestamp));
+        trackData->sender->rtpConfig->timestamp += 3000;
+        trackData->track->sendFrame(frame, (trackData->sender->rtpConfig->timestamp));
         g_print("[GStreamer] Sent Frame: %zu bytes\n", map.size);
     } 
     catch (const std::exception& e) {

@@ -25,7 +25,8 @@ DataChannelClient::DataChannelClient()
         "123",                    // 密码（和网页一致）
         rtc::IceServer::RelayType::TurnUdp  // 强制UDP，去掉 ?transport=udp
     );
-    m_config.iceServers.push_back(turnServer);}
+    //m_config.iceServers.push_back(turnServer);
+}
 
 DataChannelClient::~DataChannelClient() {
     close();
