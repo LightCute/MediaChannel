@@ -28,7 +28,7 @@ public:
 private:
     // 初始化Track回调（打开/关闭/帧数据）
     void initTrackCallback(std::shared_ptr<rtc::Track> track, bool isVideo);
-
+    void debugH264(const rtc::binary& data);
 private:
     std::shared_ptr<rtc::Track> m_videoTrack;
     std::shared_ptr<rtc::Track> m_audioTrack;

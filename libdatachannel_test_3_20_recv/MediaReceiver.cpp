@@ -49,17 +49,40 @@ void MediaReceiver::initTrackCallback(std::shared_ptr<rtc::Track> track, bool is
 
         // 直接推送完整帧，无任何中间处理
         if (isVideo) {
-            Log::info("[MediaReceiver] 收到完整H264帧 | 大小: {} bytes", data.size());
+            debugH264(data);
+            Log::info("[MediaReceiver] receive H264 Frame | size: {} bytes", data.size());
             // 修复API错误：timestamp() 是函数调用！
             m_player->pushVideoFrame(data, info.timestamp);
         } else {
-            Log::info("[MediaReceiver] 收到完整Opus帧 | 大小: {} bytes", data.size());
+            Log::info("[MediaReceiver] receive Opus Frame | size: {} bytes", data.size());
             m_player->pushAudioFrame(data, info.timestamp);
         }
     });
 }
 
+void MediaReceiver::debugH264(const rtc::binary& data) {
+    if (data.size() < 5) return;
 
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data.data());
+
+    for (size_t i = 0; i < data.size() - 4; i++) {
+        if ((ptr[i]==0 && ptr[i+1]==0 && ptr[i+2]==1) ||
+            (ptr[i]==0 && ptr[i+1]==0 && ptr[i+2]==0 && ptr[i+3]==1)) {
+
+            size_t offset = (ptr[i+2]==1) ? 3 : 4;
+            uint8_t nal = ptr[i + offset] & 0x1F;
+
+            Log::info("[NALU] type=[{}]", nal);
+            switch(nal) {
+                case 7: Log::info("(SPS)"); break;
+                case 8: Log::info("(PPS)"); break;
+                case 5: Log::info("(IDR slice)"); break;
+                case 1: Log::info("(non-IDR slice)"); break;
+                default: Log::info("(other)"); break;
+            }
+        }
+    }
+}
 
 void MediaReceiver::stop() {
     std::lock_guard<std::mutex> lock(m_mutex);
