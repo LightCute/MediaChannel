@@ -86,6 +86,7 @@ void MediaRouter::unregisterClient(std::shared_ptr<ClientTrackData> client) {
         Log::warn("[MediaRouter] Client not found for unregister");
     }
 }
+
 void MediaRouter::senderLoop() {
     Log::info("[MediaRouter] Sender loop running");
     while (m_running) {
@@ -93,10 +94,7 @@ void MediaRouter::senderLoop() {
 
         {
             std::unique_lock<std::mutex> lock(m_queueMutex);
-            m_cv.wait(lock, [&]() {
-                return !m_running || !m_queue.empty();
-            });
-
+            m_cv.wait(lock, [&]() { return !m_running || !m_queue.empty(); });
             if (!m_running) break;
             frame = std::move(m_queue.front());
             m_queue.pop();
@@ -104,38 +102,32 @@ void MediaRouter::senderLoop() {
 
         if (frame.data.empty()) continue;
 
-        // 1. 解析并缓存NALU（原有逻辑）
+        // 1. 解析并缓存关键帧（保留，用于新客户端补帧）
         parseAndCache(frame);
-
-        // 2. ✅ 核心修复：从整帧中提取【所有单个NALU】
-        std::vector<rtc::binary> nalus = splitAnnexBFrame(frame.data);
-        if (nalus.empty()) continue;
-
+        
+        // ===================== 核心修正 =====================
+        // ✅ 官方要求：直接发送 完整的H264帧（Access Unit）
+        // ✅ 不拆分、不切割、不处理，原封不动传给 sendFrame()
+        // ====================================================
         uint32_t rtp_ts = static_cast<uint32_t>(frame.timestamp_us * 90 / 1000);
+        rtc::FrameInfo info(rtp_ts);
 
-        // 3. 复制客户端列表
+        // 复制客户端列表
         std::vector<std::shared_ptr<ClientTrackData>> clientsCopy;
-        {
-            std::lock_guard<std::mutex> lock(m_clientMutex);
-            clientsCopy = m_clients;
-        }
+        { std::lock_guard<std::mutex> lock(m_clientMutex); clientsCopy = m_clients; }
         if (clientsCopy.empty()) continue;
 
-        // 4. ✅ 逐个发送【单个NALU】（符合RTP打包器要求）
-        for (const auto& nalu : nalus) {
-            for (auto& client : clientsCopy) {
-                try {
-                    rtc::FrameInfo info(rtp_ts);
-                    // 发送单个NALU ✅ 正确用法
-                    client->track->sendFrame(nalu, info);
-                    client->sender->rtpConfig->timestamp = rtp_ts;
-                } catch (const std::exception& e) {
-                    Log::error("[MediaRouter] Send NALU failed: {}", e.what());
-                }
+        // 发送完整帧（官方标准用法）
+        for (auto& client : clientsCopy) {
+            try {
+                // ✅ 正确用法：传入完整H264帧（Annex-B）
+                client->track->sendFrame(frame.data, info);
+                Log::trace("[MediaRouter] Sent complete H264 frame: size={}, ts={}", frame.data.size(), rtp_ts);
+            } catch (const std::exception& e) {
+                Log::error("[MediaRouter] Send failed: {}", e.what());
             }
         }
     }
-    Log::info("[MediaRouter] Sender loop exited");
 }
 
 // 新增：将Annex-B整帧拆分为单个NALU列表
@@ -230,7 +222,7 @@ void MediaRouter::parseAndCache(const VideoFrame& frame) {
     }
 
     // 拼接 SPS+PPS 缓存
-    if (!m_sps.empty() && !m_pps.empty() && m_cachedSpsPps.empty()) {
+    if (!m_sps.empty() && !m_pps.empty()) {
         m_cachedSpsPps = m_sps;
         m_cachedSpsPps.insert(m_cachedSpsPps.end(), m_pps.begin(), m_pps.end());
         Log::info("[MediaRouter] SPS + PPS combined (Annex-B)");

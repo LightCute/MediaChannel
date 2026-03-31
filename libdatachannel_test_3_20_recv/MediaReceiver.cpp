@@ -1,5 +1,6 @@
 #include "MediaReceiver.h"
 
+MediaReceiver::MediaReceiver() = default;
 MediaReceiver::~MediaReceiver() {
     stop();
 }
@@ -11,9 +12,8 @@ void MediaReceiver::setPlayer(std::shared_ptr<GstMediaPlayer> player) {
 
 void MediaReceiver::addTrack(std::shared_ptr<rtc::Track> track, bool isVideo) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_running || !track) return;
-
-    // 1. 保存Track
+    if(!track) return;
+    initTrackCallback(track, isVideo);
     if (isVideo) {
         m_videoTrack = track;
         Log::info("[MediaReceiver] Added Video Track");
@@ -28,47 +28,38 @@ void MediaReceiver::addTrack(std::shared_ptr<rtc::Track> track, bool isVideo) {
         track->setMediaHandler(depacketizer);
     }
 
-    // 2. 初始化所有回调（解耦到独立函数）
-    initTrackCallback(track, isVideo);
+   
 }
-
 void MediaReceiver::initTrackCallback(std::shared_ptr<rtc::Track> track, bool isVideo) {
-    // Track 打开
     track->onOpen([this, isVideo]() {
         Log::info("[MediaReceiver] {} Track Opened", isVideo ? "Video" : "Audio");
     });
 
-    // Track 关闭
     track->onClosed([this, isVideo]() {
         Log::info("[MediaReceiver] {} Track Closed", isVideo ? "Video" : "Audio");
     });
 
-    // 核心：帧数据接收（全部交给MediaReceiver处理）
+    // 🔥 核心：data = 解包器自动重组的 完整H264/Opus帧
     track->onFrame([this, isVideo](rtc::binary data, rtc::FrameInfo info) {
-        handleFrame(std::move(data), info, isVideo);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // 校验：运行状态+播放器+数据有效
+        if (!m_running || !m_player || data.empty()) {
+            return;
+        }
+
+        // 直接推送完整帧，无任何中间处理
+        if (isVideo) {
+            Log::info("[MediaReceiver] 收到完整H264帧 | 大小: {} bytes", data.size());
+            // 修复API错误：timestamp() 是函数调用！
+            m_player->pushVideoFrame(data, info.timestamp);
+        } else {
+            Log::info("[MediaReceiver] 收到完整Opus帧 | 大小: {} bytes", data.size());
+            m_player->pushAudioFrame(data, info.timestamp);
+        }
     });
 }
 
-void MediaReceiver::handleFrame(rtc::binary data, rtc::FrameInfo info, bool isVideo) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_running || !m_player || data.empty()) return;
 
-    // 日志
-    if (isVideo) {
-        static int v_cnt = 0;
-        if (++v_cnt % 30 == 0)
-            Log::debug("[MediaReceiver] Received Video Frame, size={}", data.size());
-    } else {
-        Log::warn("[MediaReceiver] Received Audio Frame, size={}", data.size());
-    }
-
-    // 分发给独立播放器（零耦合调用）
-    if (isVideo) {
-        m_player->pushVideoFrame(std::move(data), info.timestamp);
-    } else {
-        m_player->pushAudioFrame(std::move(data), info.timestamp);
-    }
-}
 
 void MediaReceiver::stop() {
     std::lock_guard<std::mutex> lock(m_mutex);

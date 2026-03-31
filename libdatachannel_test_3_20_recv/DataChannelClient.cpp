@@ -281,11 +281,13 @@ std::shared_ptr<rtc::PeerConnection> DataChannelClient::createPeerConnection(
             player->start();
             // 绑定播放器到接收器
             client->mediaReceiver->setPlayer(player);
+            client->mediaReceiver->start();
             Log::info("[PeerConnection] [{}] Created MediaReceiver + Player", id);
         }
 
         // 4. ✅ 只做一件事：把Track交给MediaReceiver（主类零媒体逻辑）
         client->mediaReceiver->addTrack(track, isVideo);
+
     });
 
     pc->onDataChannel([this, id](std::shared_ptr<rtc::DataChannel> dc) {

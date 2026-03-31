@@ -38,8 +38,9 @@ bool GstMediaPlayer::start() {
         "queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! "
         "identity silent=false name=probe1 ! "  // 探针1：appsrc输出
         "h264parse ! "
+        "avdec_h264 ! "
         "identity silent=false name=probe2 ! "  // 探针2：解析后数据
-        "decodebin ! videoconvert ! autovideosink sync=false "
+        "videoconvert ! autovideosink sync=false "
         
         // 音频支路
         "appsrc name=audio_src emit-signals=false is-live=true ! "
@@ -72,11 +73,8 @@ bool GstMediaPlayer::start() {
 
     // ===================== 设置视频 Caps =====================
     Log::info("[GstMediaPlayer] Setting video caps: H264 avc/au");
-    GstCaps* videoCaps = gst_caps_new_simple(
-        "video/x-h264",
-        "stream-format", G_TYPE_STRING, "avc",
-        "alignment", G_TYPE_STRING, "au",
-        nullptr
+    GstCaps* videoCaps = gst_caps_from_string(
+        "video/x-h264, stream-format=byte-stream, alignment=au"
     );
     g_object_set(m_appsrcVideo, "caps", videoCaps, nullptr);
     gst_caps_unref(videoCaps);
@@ -208,55 +206,25 @@ void GstMediaPlayer::pushAudioFrame(rtc::binary data, uint32_t timestamp) {
 }
 
 // 增强版 数据推送函数（带完整日志）
-void GstMediaPlayer::pushToAppSrc(GstElement* appsrc, const rtc::binary& data, uint32_t timestamp, uint32_t clockRate) {
-    if (data.empty()) {
-        Log::warn("[GstMediaPlayer] pushToAppSrc: empty data frame");
+void GstMediaPlayer::pushToAppSrc(GstElement* appsrc, const rtc::binary& data, uint32_t ts, uint32_t clock) {
+    if (!appsrc || data.empty()) {
+        Log::warn("[GstMediaPlayer] pushToAppSrc: invalid data");
         return;
     }
 
-    // 解析 NAL 类型（H264 关键帧/普通帧判断）
-    uint8_t nal_type = 0;
-    if (data.size() > 4) {
-        // 直接取第5个字节（跳过4字节长度前缀）
-        nal_type = static_cast<uint8_t>(data[4]) & 0x1F;
-    }
+    GstBuffer* buf = gst_buffer_new_memdup(data.data(), data.size());
+    GST_BUFFER_PTS(buf) = (uint64_t)ts * GST_SECOND / clock;
+    GST_BUFFER_DTS(buf) = GST_BUFFER_PTS(buf);
 
-    // 每30帧打印一次日志（避免刷屏）
-    //if (++frame_cnt % 30 == 0) 
-    {
-        Log::debug("[GstMediaPlayer] push frame size={}, nal_type={}, ts={}",
-            data.size(), nal_type, timestamp);
-    }
-
-    GstBuffer* buffer = gst_buffer_new_allocate(nullptr, data.size(), nullptr);
-    if (!buffer) {
-        Log::error("[GstMediaPlayer] Failed to create gst buffer");
-        return;
-    }
-
-    GstMapInfo map;
-    if (gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
-        memcpy(map.data, data.data(), data.size());
-        gst_buffer_unmap(buffer, &map);
-    } else {
-        Log::error("[GstMediaPlayer] Failed to map gst buffer");
-        gst_buffer_unref(buffer);
-        return;
-    }
-
-    // 设置时间戳
-    guint64 pts_ns = (guint64)timestamp * GST_SECOND / clockRate;
-    GST_BUFFER_PTS(buffer) = pts_ns;
-    GST_BUFFER_DTS(buffer) = pts_ns;
-
-    // 推送数据
     GstFlowReturn ret;
-    g_signal_emit_by_name(appsrc, "push-buffer", buffer, &ret);
-
-    // 推送失败日志
-    if (ret != GST_FLOW_OK) {
-        Log::error("[GstMediaPlayer] push-buffer failed: ret={}", static_cast<int>(ret));
+    g_signal_emit_by_name(appsrc, "push-buffer", buf, &ret);
+    
+    // ✅ 添加日志，验证推送结果
+    if (ret == GST_FLOW_OK) {
+        Log::trace("[GstMediaPlayer] Pushed buffer size={}, ts={}", data.size(), ts);
+    } else {
+        Log::error("[GstMediaPlayer] Push buffer failed, ret={}", (int)ret);
     }
 
-    gst_buffer_unref(buffer);
+    gst_buffer_unref(buf);
 }

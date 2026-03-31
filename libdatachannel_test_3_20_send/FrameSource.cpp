@@ -211,7 +211,7 @@ GstFlowReturn FrameSource::onNewSample(GstAppSink* sink) {
             }
         }
     }
-
+    Log::debug("[FrameSource] Captured frame: size={}, isIdr={}", map.size, frame.isIdr);
     // 4. 推送回调 (注意：这里是在 GST 线程中调用的)
     m_callback(frame);
 

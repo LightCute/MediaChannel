@@ -532,24 +532,17 @@ static GstPadProbeReturn H264DataProbe(GstPad *pad, GstPadProbeInfo *info, gpoin
 
 void DataChannelClient::sendCachedDataToNewClient(std::shared_ptr<ClientTrackData> newClientTrack) {
     std::lock_guard<std::mutex> lock(m_cacheMutex);
-    Log::warn("sendCachedDataToNewClient CALLED!");
-    // 注意：这里直接发送，不经过队列，因为是给特定客户端的
     try {
         if (!m_cachedSpsPps.empty()) {
-            rtc::FrameInfo info(0);
-            // 缓存的时间戳可以设为 0 或稍微往前一点
-            newClientTrack->track->sendFrame(m_cachedSpsPps, info);
+            newClientTrack->track->sendFrame(m_cachedSpsPps, rtc::FrameInfo(0));
             Log::info("[DataChannelClient] Sent cached SPS/PPS to new client");
         }
         if (!m_cachedIdr.empty()) {
-            // 计算 RTP 时间戳
             uint32_t rtp_ts = static_cast<uint32_t>(m_cachedIdrTs * 90 / 1000);
-            rtc::FrameInfo info(rtp_ts);
-
-            newClientTrack->track->sendFrame(m_cachedIdr, info);
+            newClientTrack->track->sendFrame(m_cachedIdr, rtc::FrameInfo(rtp_ts));
             Log::info("[DataChannelClient] Sent cached IDR to new client");
         }
     } catch (const std::exception& e) {
-        Log::error("[DataChannelClient] Failed to send cache: {}", e.what());
+        Log::error("[DataChannelClient] Send cache failed: {}", e.what());
     }
 }
