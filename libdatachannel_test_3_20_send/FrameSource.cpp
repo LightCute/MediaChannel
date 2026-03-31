@@ -11,7 +11,7 @@ FrameSource::FrameSource()
     : m_running(false), m_pipeline(nullptr), m_appSink(nullptr), m_firstPts(0) {
     // 注意：建议在 main() 函数里调用一次 gst_init，而不是在这里
     // 如果确定外部没初始化，可以在这里打开：
-    // gst_init(nullptr, nullptr);
+    gst_init(nullptr, nullptr);
 }
 
 FrameSource::~FrameSource() {
@@ -43,11 +43,17 @@ bool FrameSource::start() {
         image/jpeg,width=640,height=480,framerate=30/1 ! 
         jpegdec ! 
         videoconvert ! 
-        queue leaky=downstream max-size-buffers=2 ! 
-        x264enc tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 bframes=0 ! 
-        h264parse config-interval=-1 ! 
-        video/x-h264,stream-format=avc,alignment=au ! 
-        appsink name=video_sink emit-signals=true sync=false
+        tee name=t
+
+        t. ! queue leaky=downstream max-size-buffers=2 ! 
+            x264enc tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 bframes=0 ! 
+            h264parse config-interval=-1 ! 
+            video/x-h264,stream-format=avc,alignment=au ! 
+            appsink name=video_sink emit-signals=true sync=false
+
+        t. ! queue ! 
+            videoconvert ! 
+            autovideosink sync=false
     )";
 
     GError* error = nullptr;

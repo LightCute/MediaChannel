@@ -100,26 +100,13 @@ private:
     DispatchQueue m_MainThread;
 
 
-    // --- GStreamer 桥接层 ---
+
+    std::unique_ptr<FrameSource> m_frameSource;
+    void onFrameReceived(const VideoFrame& frame);
     void startGStreamerPipeline();
-    void stopGStreamerPipeline();
-    static GstFlowReturn onNewSample(GstAppSink* sink, gpointer user_data);
-    // --- GStreamer 成员变量 ---
-    GstElement* m_gstPipeline = nullptr;
-    GstElement* m_gstAppSink = nullptr;
-    std::shared_ptr<ClientTrackData> m_currentVideoTrack;
-    uint64_t m_firstPts = 0;
-    std::atomic<bool> m_gstRunning{false};
 
 
-
-
-
-    struct VideoFrame {
-        rtc::binary data;
-        uint64_t timestamp_us;
-        bool isIdr; // 标记是否为关键帧
-    };
+    
     BlockingQueue<VideoFrame> m_frameQueue;
     std::mutex m_cacheMutex;
     rtc::binary m_cachedSpsPps;
