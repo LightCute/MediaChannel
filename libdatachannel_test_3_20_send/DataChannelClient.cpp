@@ -127,10 +127,14 @@ void DataChannelClient::callPeer(const std::string& peerId) {
     
     client->video = videoTrackData;
 
-    videoTrackData->track->onOpen([this, peerId, client]() {
+    videoTrackData->track->onOpen([this, peerId, client, videoTrackData]() {
         Log::info("[DataChannelClient] Video track open for {}, starting GStreamer", peerId);
         // ✅ 现在client->video 100%有值，传给GST
-        startGStreamerPipeline(client->video); 
+        // 1. 尝试给新客户端发缓存的 SPS/PPS/IDR (快速出图)
+
+        // 2. 启动 GStreamer (如果还没启动的话)
+        // 注意：这里不再传 videoTrack 给 startGStreamerPipeline，因为我们是广播模式
+        startGStreamerPipeline(); 
     });
     // client->audio = addAudio(pc, 111, audioSsrc, "audio-stream", "stream-" + peerId, [this, peerId, wc = make_weak_ptr(client)]() {
     //     m_MainThread.dispatch([this, wc, peerId]() {
@@ -426,7 +430,7 @@ std::shared_ptr<ClientTrackData> DataChannelClient::addVideo(const std::shared_p
     // create RTP configuration
     auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, cname, payloadType, rtc::H264RtpPacketizer::ClockRate);
     // create packetizer
-    auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, rtpConfig);
+    auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::Length, rtpConfig);
     // add RTCP SR handler
     auto srReporter = std::make_shared<rtc::RtcpSrReporter>(rtpConfig);
     packetizer->addToChain(srReporter);
@@ -495,16 +499,17 @@ std::shared_ptr<ClientTrackData> DataChannelClient::addAudio(const std::shared_p
 static GstPadProbeReturn H264DataProbe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data);
 
 // --- 启动 Linux GStreamer 实时采集 Pipeline ---
-void DataChannelClient::startGStreamerPipeline(std::optional<std::shared_ptr<ClientTrackData>> videoTrack) {
+void DataChannelClient::startGStreamerPipeline() {
     if (m_gstRunning.exchange(true)) {
         Log::warn("[GStreamer] Pipeline already running");
         return;
     }
 
-    if (videoTrack.has_value()) {
-        // 2. 取出内部的 shared_ptr 直接赋值！
-        m_currentVideoTrack = videoTrack.value(); 
-    }    
+    m_shouldStop = false;
+    m_senderThread = std::thread(&DataChannelClient::senderLoop, this);
+    m_firstPts = 0;
+    Log::info("[GStreamer] Creating pipeline...");
+
     m_firstPts = 0;
 
     Log::info("[GStreamer] Creating pipeline...");
@@ -520,14 +525,26 @@ void DataChannelClient::startGStreamerPipeline(std::optional<std::shared_ptr<Cli
     //     appsink name=video_sink emit-signals=true sync=false
     // )";
 
+    // const char* pipelineDesc = R"(
+    //     v4l2src device=/dev/video0 name=video_src ! 
+    //     image/jpeg,width=640,height=480,framerate=30/1 ! 
+    //     jpegdec ! 
+    //     videoconvert ! 
+    //     queue leaky=downstream max-size-buffers=1 ! 
+    //     x264enc name=h264_encoder tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 ! 
+    //     video/x-h264,stream-format=byte-stream,alignment=au ! 
+    //     appsink name=video_sink emit-signals=true sync=false
+    // )";
+
     const char* pipelineDesc = R"(
         v4l2src device=/dev/video0 name=video_src ! 
         image/jpeg,width=640,height=480,framerate=30/1 ! 
         jpegdec ! 
         videoconvert ! 
         queue leaky=downstream max-size-buffers=1 ! 
-        x264enc name=h264_encoder tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 ! 
-        video/x-h264,stream-format=byte-stream,alignment=au ! 
+        x264enc name=h264_encoder tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 bframes=0 ! 
+        h264parse config-interval=1 ! 
+        video/x-h264,stream-format=avc,alignment=au ! 
         appsink name=video_sink emit-signals=true sync=false
     )";
 
@@ -665,54 +682,139 @@ static GstPadProbeReturn H264DataProbe(GstPad *pad, GstPadProbeInfo *info, gpoin
 GstFlowReturn DataChannelClient::onNewSample(GstAppSink* sink, gpointer user_data) {
     auto* self = static_cast<DataChannelClient*>(user_data);
     
-    // 调试：证明回调触发
-    g_print("[GStreamer] onNewSample Triggered!\n");
+    if (!self->m_gstRunning) return GST_FLOW_OK;
 
-    if (!self->m_gstRunning || !self->m_currentVideoTrack) {
-        return GST_FLOW_OK;
-    }
-
-    // 取数据
     GstSample* sample = gst_app_sink_pull_sample(sink);
     if (!sample) return GST_FLOW_OK;
     
     GstBuffer* buffer = gst_sample_get_buffer(sample);
+    if (!buffer) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
     GstMapInfo map;
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
         gst_sample_unref(sample);
         return GST_FLOW_OK;
     }
 
-    // 转WebRTC数据格式
-    rtc::binary frame(reinterpret_cast<std::byte*>(map.data), 
-                     reinterpret_cast<std::byte*>(map.data + map.size));
+    // 1. 计算时间戳
+    GstClockTime pts = GST_BUFFER_PTS(buffer);
+    uint64_t timestamp_us = 0;
+    if (pts == GST_CLOCK_TIME_NONE) {
+        pts = g_get_monotonic_time() * 1000; 
+    }
+    if (self->m_firstPts == 0) {
+        self->m_firstPts = pts;
+        timestamp_us = 0;
+    } else {
+        timestamp_us = (pts - self->m_firstPts) / 1000;
+    }
+    
+    // 2. 封装数据
+    rtc::binary frame_data(reinterpret_cast<std::byte*>(map.data), 
+                           reinterpret_cast<std::byte*>(map.data + map.size));
 
-    try {
-        auto& trackData = self->m_currentVideoTrack;
-        const uint32_t clock = trackData->sender->rtpConfig->clockRate;
-        const uint32_t ts_inc = clock / 30; // 30fps
+    // 3. 解析H264帧，缓存SPS/PPS/IDR
+    bool isIdr = false;
+    if (frame_data.size() > 5) {
+        size_t offset = 0;
+        while (offset + 4 <= frame_data.size()) {
+            uint32_t nal_size =
+                (uint32_t(frame_data[offset]) << 24) |
+                (uint32_t(frame_data[offset + 1]) << 16) |
+                (uint32_t(frame_data[offset + 2]) << 8) |
+                (uint32_t(frame_data[offset + 3]));
 
-        // 时间戳管理
-        if (self->m_firstPts == 0) {
-            trackData->sender->rtpConfig->timestamp = trackData->sender->rtpConfig->startTimestamp;
-            self->m_firstPts = 1;
-        } else {
-            trackData->sender->rtpConfig->timestamp += ts_inc;
+            offset += 4;
+            if (offset + nal_size > frame_data.size()) break;
+
+            uint8_t nal_header = uint8_t(frame_data[offset]);
+            uint8_t nal_type = nal_header & 0x1F;
+
+            // 缓存SPS/PPS
+            if (nal_type == 7 || nal_type == 8) {
+                std::lock_guard<std::mutex> lock(self->m_cacheMutex);
+                self->m_cachedSpsPps = frame_data;
+            }
+            // 标记IDR帧
+            if (nal_type == 5) {
+                isIdr = true;
+                std::lock_guard<std::mutex> lock(self->m_cacheMutex);
+                self->m_cachedIdr = frame_data;
+                self->m_cachedIdrTs = timestamp_us;
+            }
+            offset += nal_size;
         }
-
-        // 发送帧
-        trackData->sender->rtpConfig->timestamp += 3000;
-        trackData->track->sendFrame(frame, (trackData->sender->rtpConfig->timestamp));
-        g_print("[GStreamer] Sent Frame: %zu bytes\n", map.size);
-    } 
-    catch (const std::exception& e) {
-        Log::error("[GStreamer] Send Failed: {}", e.what());
     }
 
-    // 释放资源
+    // ====================== ✅ 方案二核心逻辑：IDR帧触发补帧 ======================
+    if (isIdr) {
+        std::lock_guard<std::mutex> lock(self->m_cacheMutex);
+        // 遍历所有客户端，给未收到关键帧的客户端补帧
+        for (auto& [id, client] : self->m_clients) {
+            // 只处理视频轨道有效、未收到关键帧的客户端
+            if (client->video && !client->hasReceivedKeyframe) {
+                try {
+                    // 1. 发送SPS/PPS（时间戳0）
+                    if (!self->m_cachedSpsPps.empty()) {
+                        rtc::FrameInfo info(0);
+                        client->video.value()->track->sendFrame(self->m_cachedSpsPps, info);
+                    }
+
+                    // 2. 发送IDR关键帧
+                    uint32_t rtp_ts = static_cast<uint32_t>(timestamp_us * 90 / 1000);
+                    rtc::FrameInfo info2(rtp_ts);
+                    client->video.value()->track->sendFrame(frame_data, info2);
+
+                    // 标记客户端已收到关键帧
+                    client->hasReceivedKeyframe = true;
+                    Log::info("🔥 Sent first keyframe to client: {}", id);
+                } catch (const std::exception& e) {
+                    Log::error("Failed to send keyframe to {}: {}", id, e.what());
+                }
+            }
+        }
+    }
+    // ========================================================================
+
+    Log::debug("[GStreamer] Frame Captured, size={}, ts={}us, IDR={}", 
+            frame_data.size(), timestamp_us, isIdr);
+    // 4. 帧入队，广播给所有客户端
+    self->m_frameQueue.push({std::move(frame_data), timestamp_us, isIdr});
+
+    // 5. 释放资源
     gst_buffer_unmap(buffer, &map);
     gst_sample_unref(sample);
+    
+
     return GST_FLOW_OK;
+}
+
+
+void DataChannelClient::sendCachedDataToNewClient(std::shared_ptr<ClientTrackData> newClientTrack) {
+    std::lock_guard<std::mutex> lock(m_cacheMutex);
+    Log::warn("sendCachedDataToNewClient CALLED!");
+    // 注意：这里直接发送，不经过队列，因为是给特定客户端的
+    try {
+        if (!m_cachedSpsPps.empty()) {
+            rtc::FrameInfo info(0);
+            // 缓存的时间戳可以设为 0 或稍微往前一点
+            newClientTrack->track->sendFrame(m_cachedSpsPps, info);
+            Log::info("[DataChannelClient] Sent cached SPS/PPS to new client");
+        }
+        if (!m_cachedIdr.empty()) {
+            // 计算 RTP 时间戳
+            uint32_t rtp_ts = static_cast<uint32_t>(m_cachedIdrTs * 90 / 1000);
+            rtc::FrameInfo info(rtp_ts);
+
+            newClientTrack->track->sendFrame(m_cachedIdr, info);
+            Log::info("[DataChannelClient] Sent cached IDR to new client");
+        }
+    } catch (const std::exception& e) {
+        Log::error("[DataChannelClient] Failed to send cache: {}", e.what());
+    }
 }
 
 // ==========================================
@@ -722,11 +824,90 @@ void DataChannelClient::stopGStreamerPipeline() {
     if (!m_gstRunning.exchange(false)) return;
     Log::info("[GStreamer] Stopping...");
 
+    // 1. 停止队列
+    m_frameQueue.stop();
+
+    // 2. 停止线程
+    m_shouldStop = true;
+    if (m_senderThread.joinable()) {
+        m_senderThread.join();
+    }
+
+    // 3. 停止 GStreamer
     if (m_gstPipeline) {
         gst_element_set_state(m_gstPipeline, GST_STATE_NULL);
         gst_object_unref(m_gstPipeline);
         m_gstPipeline = nullptr;
     }
     m_gstAppSink = nullptr;
-    m_currentVideoTrack.reset();
+    
+    // 4. 清空缓存
+    {
+        std::lock_guard<std::mutex> lock(m_cacheMutex);
+        m_cachedSpsPps.clear();
+        m_cachedIdr.clear();
+    }
+
+    m_firstPts = 0; 
+}
+
+
+//-------------------------------
+void DataChannelClient::enqueueFrame(rtc::binary data, uint64_t ts_us) {
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    // 可选：如果队列积压太多，丢帧 (防止内存爆炸)
+    if (m_frameQueue.size() > 10) {
+        Log::warn("[GStreamer] Queue overflow, dropping frame");
+        return; 
+    }
+    m_frameQueue.push({std::move(data), ts_us});
+    m_queueCv.notify_one();
+}
+void DataChannelClient::senderLoop() {
+    Log::info("[Sender] Thread started");
+    while (!m_shouldStop) {
+        // 使用现成的 BlockingQueue
+        auto frame = m_frameQueue.waitAndPop();
+        
+        if (m_shouldStop) break;
+        if (frame.data.empty()) continue;
+
+        // 遍历所有客户端
+        std::vector<std::shared_ptr<Client>> activeClients;
+        {
+            // 这里最好给 m_clients 也加个锁，如果在其他地方有修改的话
+            // 假设 m_clients 主要在主线程操作，这里只读，问题不大
+            for (auto& [id, client] : m_clients) {
+                 if (client->video) {
+                    activeClients.push_back(client);
+                 }
+            }
+        }
+
+        if (activeClients.empty()) continue;
+
+        // 计算 RTP 时间戳
+        uint32_t rtp_ts = static_cast<uint32_t>(frame.timestamp_us * 90 / 1000); 
+
+        for (auto& client : activeClients) {
+            try {
+                rtc::FrameInfo info(rtp_ts);
+                
+                
+                // 发送
+                client->video.value()->track->sendFrame(frame.data, info);
+                Log::info("SEND frame size={}", frame.data.size());
+                
+                // 【重要】更新 RTCP SR 报告器
+                // 这会让接收端看到正确的 NTP 时间戳
+                client->video.value()->sender->rtpConfig->timestamp = rtp_ts;
+                // 注意：如果需要非常精确的 NTP  wallclock time，还需要更新 lastWallClockTime
+                // 这里简化处理，libdatachannel 内部通常会在调用 sendFrame 时处理部分逻辑，但显式更新 timestamp 是好的实践
+                
+            } catch (const std::exception& e) {
+                Log::error("[Sender] Failed to send to client: {}", e.what());
+            }
+        }
+    }
+    Log::info("[Sender] Thread stopped");
 }

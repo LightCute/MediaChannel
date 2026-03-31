@@ -1,124 +1,176 @@
 #include "GstMediaPlayer.h"
 #include <iostream>
+#include "utilities/log.h"
+#include <gst/gst.h>
+
+// 静态帧计数器（用于日志打印）
+static int frame_cnt = 0;
 
 GstMediaPlayer::GstMediaPlayer() 
     : m_pipeline(nullptr), m_appsrcVideo(nullptr), m_appsrcAudio(nullptr), m_isRunning(false) {
     gst_init(nullptr, nullptr);
+    Log::info("[GstMediaPlayer] Constructor initialized, GStreamer inited");
 }
 
 GstMediaPlayer::~GstMediaPlayer() {
     stop();
 }
 
+// 静态探针回调函数（探测数据流）
+void GstMediaPlayer::onHandoff(GstElement* identity, GstBuffer* buffer, gpointer user_data) {
+    (void)identity;
+    (void)user_data;
+    Log::debug("[GstMediaPlayer] Data probe got buffer size={} bytes", gst_buffer_get_size(buffer));
+}
+
 bool GstMediaPlayer::start() {
-    if (m_isRunning) return true;
+    if (m_isRunning) {
+        Log::warn("[GstMediaPlayer] Already running, skip start");
+        return true;
+    }
 
-    g_print("[GstMediaPlayer] Starting pipeline...\n");
+    Log::info("[GstMediaPlayer] Starting pipeline...");
 
-    // ===============================================================
-    // 核心 Pipeline 字符串
-    // 注意：
-    // 1. 视频：sync=false (低延迟)
-    // 2. 音频：sync=false (先不管同步，只要出声！)
-    // ===============================================================
+    // ===================== 插入 identity 数据探针（解码链路探测器） =====================
     std::string pipelineDesc = 
-        // ---------------- 视频支路 (保持原样) ----------------
+        // 视频支路 + 探针
         "appsrc name=video_src emit-signals=false is-live=true ! "
-        "queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! " // 不限制队列
-        "h264parse ! decodebin ! videoconvert ! autovideosink sync=false "
+        "queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! "
+        "identity silent=false name=probe1 ! "  // 探针1：appsrc输出
+        "h264parse ! "
+        "identity silent=false name=probe2 ! "  // 探针2：解析后数据
+        "decodebin ! videoconvert ! autovideosink sync=false "
         
-        // ---------------- 音频支路 (关键修改) ----------------
+        // 音频支路
         "appsrc name=audio_src emit-signals=false is-live=true ! "
         "queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! "
-        "opusparse ! " // 专门解析 Opus
-        "opusdec ! "    // 专门解码 Opus
-        "audioconvert ! "
-        "audioresample ! "
-        "autoaudiosink sync=false"; // sync=false 强制播放，不等待时钟
+        "opusparse ! opusdec ! audioconvert ! audioresample ! autoaudiosink sync=false ";
+
+    Log::debug("[GstMediaPlayer] Pipeline desc: {}", pipelineDesc);
 
     GError* error = nullptr;
     m_pipeline = gst_parse_launch(pipelineDesc.c_str(), &error);
     if (error) {
-        g_printerr("[GstMediaPlayer] Pipeline ERROR: %s\n", error->message);
+        Log::error("[GstMediaPlayer] Pipeline parse error: {}", error->message);
         g_error_free(error);
         return false;
     }
+
+    Log::info("[GstMediaPlayer] Pipeline created successfully");
 
     // 获取 AppSrc
     m_appsrcVideo = gst_bin_get_by_name(GST_BIN(m_pipeline), "video_src");
     m_appsrcAudio = gst_bin_get_by_name(GST_BIN(m_pipeline), "audio_src");
 
     if (!m_appsrcVideo || !m_appsrcAudio) {
-        g_printerr("[GstMediaPlayer] Failed to get AppSrc elements\n");
+        Log::error("[GstMediaPlayer] Failed to get appsrc (video={}, audio={})",
+            m_appsrcVideo != nullptr, m_appsrcAudio != nullptr);
         return false;
     }
 
-    // ===============================================================
-    // 设置 Video Caps (保持不变)
-    // ===============================================================
+    Log::info("[GstMediaPlayer] AppSrc acquired successfully");
+
+    // ===================== 设置视频 Caps =====================
+    Log::info("[GstMediaPlayer] Setting video caps: H264 avc/au");
     GstCaps* videoCaps = gst_caps_new_simple(
         "video/x-h264",
-        "stream-format", G_TYPE_STRING, "byte-stream",
+        "stream-format", G_TYPE_STRING, "avc",
         "alignment", G_TYPE_STRING, "au",
         nullptr
     );
     g_object_set(m_appsrcVideo, "caps", videoCaps, nullptr);
     gst_caps_unref(videoCaps);
 
-    // ===============================================================
-    // ✅✅✅ 设置 Audio Caps (关键！)
-    // 这里我们不假设太多，只说这是 Opus
-    // ===============================================================
+    // ===================== 设置音频 Caps =====================
+    Log::info("[GstMediaPlayer] Setting audio caps: opus 48k stereo");
     GstCaps* audioCaps = gst_caps_new_simple(
         "audio/x-opus",
-        nullptr // 不添加任何额外限制，让 GStreamer 自适应
+        "channels", G_TYPE_INT, 2,
+        "rate", G_TYPE_INT, 48000,
+        nullptr
     );
     g_object_set(m_appsrcAudio, "caps", audioCaps, nullptr);
     gst_caps_unref(audioCaps);
 
-    // 启动 Pipeline
-    gst_element_set_state(m_pipeline, GST_STATE_PLAYING);
-    
-    // ===============================================================
-    // 增加：监听 Pipeline 总线上的消息 (看报错)
-    // ===============================================================
+    // ===================== 连接数据探针信号 =====================
+    GstElement* probe1 = gst_bin_get_by_name(GST_BIN(m_pipeline), "probe1");
+    GstElement* probe2 = gst_bin_get_by_name(GST_BIN(m_pipeline), "probe2");
+    if (probe1) {
+        g_signal_connect(probe1, "handoff", G_CALLBACK(onHandoff), this);
+        gst_object_unref(probe1);
+    }
+    if (probe2) {
+        g_signal_connect(probe2, "handoff", G_CALLBACK(onHandoff), this);
+        gst_object_unref(probe2);
+    }
+    Log::info("[GstMediaPlayer] Data probes connected successfully");
+
+    // ===================== 启动管道 =====================
+    GstStateChangeReturn ret = gst_element_set_state(m_pipeline, GST_STATE_PLAYING);
+    Log::info("[GstMediaPlayer] Set pipeline PLAYING, ret={}", static_cast<int>(ret));
+
+    // ===================== 总线监听 =====================
     GstBus* bus = gst_element_get_bus(m_pipeline);
     gst_bus_add_watch(bus, (GstBusFunc)GstMediaPlayer::onGstMessage, this);
     gst_object_unref(bus);
 
     m_isRunning = true;
-    g_print("[GstMediaPlayer] Started successfully (A/V Sync disabled for testing)\n");
+    Log::info("[GstMediaPlayer] Started successfully (A/V Sync disabled for testing)");
     return true;
 }
 
-// 新增：监听 GStreamer 错误消息
+// 增强版 GStreamer 消息监听
 gboolean GstMediaPlayer::onGstMessage(GstBus* bus, GstMessage* msg, gpointer user_data) {
     (void)bus;
-    (void)user_data;
-    
+    GstMediaPlayer* self = (GstMediaPlayer*)user_data;
+
     switch (GST_MESSAGE_TYPE(msg)) {
+        // 错误信息
         case GST_MESSAGE_ERROR: {
             GError* err;
             gchar* debug;
             gst_message_parse_error(msg, &err, &debug);
-            g_printerr("[GstMediaPlayer] 🔴 ERROR: %s\n", err->message);
-            g_printerr("[GstMediaPlayer] 🔴 Debug: %s\n", debug);
+            Log::error("[GstMediaPlayer] ERROR: {} | Debug: {}", err->message, debug);
             g_error_free(err);
             g_free(debug);
             break;
         }
+        // 警告信息
         case GST_MESSAGE_WARNING: {
             GError* err;
             gchar* debug;
             gst_message_parse_warning(msg, &err, &debug);
-            g_printerr("[GstMediaPlayer] 🟡 WARNING: %s\n", err->message);
+            Log::warn("[GstMediaPlayer] WARNING: {} | Debug: {}", err->message, debug);
             g_error_free(err);
             g_free(debug);
             break;
         }
-        case GST_MESSAGE_STATE_CHANGED:
-            // 忽略状态变化
+        // 普通信息
+        case GST_MESSAGE_INFO: {
+            GError* err;
+            gchar* debug;
+            gst_message_parse_info(msg, &err, &debug);
+            Log::info("[GstMediaPlayer] INFO: {}", err->message);
+            g_error_free(err);
+            g_free(debug);
             break;
+        }
+        // 管道状态变化
+        case GST_MESSAGE_STATE_CHANGED: {
+            if (GST_MESSAGE_SRC(msg) == GST_OBJECT(self->m_pipeline)) {
+                GstState old_state, new_state, pending;
+                gst_message_parse_state_changed(msg, &old_state, &new_state, &pending);
+                Log::info("[GstMediaPlayer] Pipeline state changed: {} -> {}",
+                    gst_element_state_get_name(old_state),
+                    gst_element_state_get_name(new_state));
+            }
+            break;
+        }
+        // 流结束
+        case GST_MESSAGE_EOS:
+            Log::warn("[GstMediaPlayer] Received EOS (stream ended)");
+            break;
+
         default:
             break;
     }
@@ -126,7 +178,12 @@ gboolean GstMediaPlayer::onGstMessage(GstBus* bus, GstMessage* msg, gpointer use
 }
 
 void GstMediaPlayer::stop() {
-    if (!m_isRunning) return;
+    if (!m_isRunning) {
+        Log::warn("[GstMediaPlayer] Already stopped, skip stop");
+        return;
+    }
+
+    Log::info("[GstMediaPlayer] Stopping pipeline...");
     m_isRunning = false;
 
     if (m_pipeline) {
@@ -136,48 +193,69 @@ void GstMediaPlayer::stop() {
         m_appsrcVideo = nullptr;
         m_appsrcAudio = nullptr;
     }
-    g_print("[GstMediaPlayer] Stopped\n");
+
+    Log::info("[GstMediaPlayer] Stopped successfully");
 }
 
 void GstMediaPlayer::pushVideoFrame(rtc::binary data, uint32_t timestamp) {
     if (!m_isRunning || !m_appsrcVideo) return;
-    pushToAppSrc(m_appsrcVideo, data, timestamp, 90000); // 视频时钟 90kHz
+    pushToAppSrc(m_appsrcVideo, data, timestamp, 90000);
 }
 
 void GstMediaPlayer::pushAudioFrame(rtc::binary data, uint32_t timestamp) {
     if (!m_isRunning || !m_appsrcAudio) return;
-    pushToAppSrc(m_appsrcAudio, data, timestamp, 48000); // 音频时钟 48kHz (Opus 标准)
+    pushToAppSrc(m_appsrcAudio, data, timestamp, 48000);
 }
 
-// 通用推送函数
+// 增强版 数据推送函数（带完整日志）
 void GstMediaPlayer::pushToAppSrc(GstElement* appsrc, const rtc::binary& data, uint32_t timestamp, uint32_t clockRate) {
-    if (data.empty()) return;
+    if (data.empty()) {
+        Log::warn("[GstMediaPlayer] pushToAppSrc: empty data frame");
+        return;
+    }
+
+    // 解析 NAL 类型（H264 关键帧/普通帧判断）
+    uint8_t nal_type = 0;
+    if (data.size() > 4) {
+        // 直接取第5个字节（跳过4字节长度前缀）
+        nal_type = static_cast<uint8_t>(data[4]) & 0x1F;
+    }
+
+    // 每30帧打印一次日志（避免刷屏）
+    //if (++frame_cnt % 30 == 0) 
+    {
+        Log::debug("[GstMediaPlayer] push frame size={}, nal_type={}, ts={}",
+            data.size(), nal_type, timestamp);
+    }
 
     GstBuffer* buffer = gst_buffer_new_allocate(nullptr, data.size(), nullptr);
-    if (!buffer) return;
+    if (!buffer) {
+        Log::error("[GstMediaPlayer] Failed to create gst buffer");
+        return;
+    }
 
-    // 1. 拷贝数据
     GstMapInfo map;
     if (gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
         memcpy(map.data, data.data(), data.size());
         gst_buffer_unmap(buffer, &map);
     } else {
+        Log::error("[GstMediaPlayer] Failed to map gst buffer");
         gst_buffer_unref(buffer);
         return;
     }
 
-    // 2. 简单的时间戳设置 (可选，先不管，让 GStreamer 自己处理)
-    GST_BUFFER_PTS(buffer) = GST_CLOCK_TIME_NONE;
-    GST_BUFFER_DTS(buffer) = GST_CLOCK_TIME_NONE;
-    GST_BUFFER_DURATION(buffer) = GST_CLOCK_TIME_NONE;
+    // 设置时间戳
+    guint64 pts_ns = (guint64)timestamp * GST_SECOND / clockRate;
+    GST_BUFFER_PTS(buffer) = pts_ns;
+    GST_BUFFER_DTS(buffer) = pts_ns;
 
-    // 3. 推入数据
+    // 推送数据
     GstFlowReturn ret;
     g_signal_emit_by_name(appsrc, "push-buffer", buffer, &ret);
-    
+
+    // 推送失败日志
     if (ret != GST_FLOW_OK) {
-        // 只有出错时才打印
-        // g_printerr("[GstMediaPlayer] Push failed: %d\n", ret);
+        Log::error("[GstMediaPlayer] push-buffer failed: ret={}", static_cast<int>(ret));
     }
 
     gst_buffer_unref(buffer);

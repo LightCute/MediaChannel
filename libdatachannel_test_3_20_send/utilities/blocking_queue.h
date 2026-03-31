@@ -48,10 +48,21 @@ public:
         return item;
     }
 
+    size_t size() const {
+        // 注意：因为 size() 是 const 函数，所以 m_mutex 必须声明为 mutable
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_queue.size();
+    }
+
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_queue.empty();
+    }
+
 private:
 
     std::queue<T> m_queue;
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     std::atomic<bool> m_stop;
 };

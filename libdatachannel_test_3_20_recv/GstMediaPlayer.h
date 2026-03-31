@@ -22,9 +22,12 @@ public:
     void pushAudioFrame(rtc::binary data, uint32_t timestamp);
 
 private:
+    // 静态探针回调
+    static void onHandoff(GstElement* identity, GstBuffer* buffer, gpointer user_data);
+    // 总线消息回调
+    static gboolean onGstMessage(GstBus* bus, GstMessage* msg, gpointer user_data);
     // 内部推送函数
     void pushToAppSrc(GstElement* appsrc, const rtc::binary& data, uint32_t timestamp, uint32_t clockRate);
-    static gboolean onGstMessage(GstBus* bus, GstMessage* msg, gpointer user_data);
     GstElement* m_pipeline;
     GstElement* m_appsrcVideo;
     GstElement* m_appsrcAudio;

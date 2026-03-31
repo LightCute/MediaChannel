@@ -314,7 +314,7 @@ uint64_t currentTimeInMicroSeconds() {
 }
 
 ========== ./DataChannelClient.h ==========
-Lines: 94
+Lines: 134
 
 #pragma once
 
@@ -328,9 +328,15 @@ Lines: 94
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 #include "utilities/log.h"
 #include "h264fileparser.hpp"
 #include "helpers.hpp"
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+#include "utilities/blocking_queue.h"
 class DataChannelClient {
 public:
     using OnConnectedCallback = std::function<void(const std::string& peerId)>;
@@ -409,6 +415,40 @@ private:
     std::unordered_map<std::string, std::shared_ptr<Client>> m_clients;
     std::optional<std::shared_ptr<Stream>> m_avStream;
     DispatchQueue m_MainThread;
+
+
+    // --- GStreamer 桥接层 ---
+    void startGStreamerPipeline();
+    void stopGStreamerPipeline();
+    static GstFlowReturn onNewSample(GstAppSink* sink, gpointer user_data);
+    // --- GStreamer 成员变量 ---
+    GstElement* m_gstPipeline = nullptr;
+    GstElement* m_gstAppSink = nullptr;
+    std::shared_ptr<ClientTrackData> m_currentVideoTrack;
+    uint64_t m_firstPts = 0;
+    std::atomic<bool> m_gstRunning{false};
+
+
+
+
+
+    struct VideoFrame {
+        rtc::binary data;
+        uint64_t timestamp_us;
+        bool isIdr; // 标记是否为关键帧
+    };
+    BlockingQueue<VideoFrame> m_frameQueue;
+    std::mutex m_cacheMutex;
+    rtc::binary m_cachedSpsPps;
+    rtc::binary m_cachedIdr;
+    uint64_t m_cachedIdrTs = 0;
+    std::mutex m_queueMutex;
+    std::condition_variable m_queueCv;
+    std::thread m_senderThread;
+    std::atomic<bool> m_shouldStop{false};
+    void enqueueFrame(rtc::binary data, uint64_t ts_us);
+    void senderLoop(); 
+    void sendCachedDataToNewClient(std::shared_ptr<ClientTrackData> newClientTrack);
 };
 ========== ./h264fileparser.cpp ==========
 Lines: 71
@@ -649,7 +689,7 @@ void DispatchQueue::dispatchThreadHandler(void) {
 }
 
 ========== ./DataChannelClient.cpp ==========
-Lines: 638
+Lines: 895
 
 #include "DataChannelClient.h"
 #include <algorithm>
@@ -658,8 +698,7 @@ Lines: 638
 #include <stdexcept>
 #include <thread>
 #include "opusfileparser.hpp"
-#include <gst/gst.h>
-#include <gst/app/gstappsink.h>
+
 
 using namespace std::chrono_literals;
 using nlohmann::json;
@@ -680,7 +719,8 @@ DataChannelClient::DataChannelClient()
         "123",                    // 密码（和网页一致）
         rtc::IceServer::RelayType::TurnUdp  // 强制UDP，去掉 ?transport=udp
     );
-    m_config.iceServers.push_back(turnServer);
+    //m_config.iceServers.push_back(turnServer);
+    gst_init(nullptr, nullptr);
 }
 
 DataChannelClient::~DataChannelClient() {
@@ -776,25 +816,28 @@ void DataChannelClient::callPeer(const std::string& peerId) {
     uint32_t videoSsrc = generateUniqueSSRC(peerId + "_video");
     uint32_t audioSsrc = generateUniqueSSRC(peerId + "_audio");
 
+    auto videoTrackData = addVideo(pc, 102, videoSsrc, "video-stream", "stream-" + peerId, nullptr);
     
-    auto videoTrackData = addVideo(pc, 102, videoSsrc, "video-stream", "stream-" + peerId, 
-    [this, peerId, wc = make_weak_ptr(client)]() {
-        m_MainThread.dispatch([this, wc, peerId]() {
-            if (auto c = wc.lock()) {
-                addToStream(c, true); // 复用 Example 的状态管理
-            }
-        });
-        Log::info("[DataChannelClient] Video track for {} is open", peerId);
-    });
+    client->video = videoTrackData;
 
-    client->audio = addAudio(pc, 111, audioSsrc, "audio-stream", "stream-" + peerId, [this, peerId, wc = make_weak_ptr(client)]() {
-        m_MainThread.dispatch([this, wc, peerId]() {
-            if (auto c = wc.lock()) {
-                addToStream(c, false);
-            }
-        });
-        Log::info("[DataChannelClient] Audio track for {} is open", peerId);
+    videoTrackData->track->onOpen([this, peerId, client, videoTrackData]() {
+        Log::info("[DataChannelClient] Video track open for {}, starting GStreamer", peerId);
+        // ✅ 现在client->video 100%有值，传给GST
+        // 1. 尝试给新客户端发缓存的 SPS/PPS/IDR (快速出图)
+        sendCachedDataToNewClient(videoTrackData);
+
+        // 2. 启动 GStreamer (如果还没启动的话)
+        // 注意：这里不再传 videoTrack 给 startGStreamerPipeline，因为我们是广播模式
+        startGStreamerPipeline(); 
     });
+    // client->audio = addAudio(pc, 111, audioSsrc, "audio-stream", "stream-" + peerId, [this, peerId, wc = make_weak_ptr(client)]() {
+    //     m_MainThread.dispatch([this, wc, peerId]() {
+    //         if (auto c = wc.lock()) {
+    //             addToStream(c, false);
+    //         }
+    //     });
+    //     Log::info("[DataChannelClient] Audio track for {} is open", peerId);
+    // });
 
     const std::string label = "test";
     Log::info("[DataChannelClient] Creating DataChannel with label \"{}\"", label);
@@ -829,7 +872,6 @@ void DataChannelClient::callPeer(const std::string& peerId) {
     });
 
     {
-        client->video = videoTrackData;
         client->dataChannel = dc;
     }
 }
@@ -857,6 +899,8 @@ void DataChannelClient::sendMessage(const std::string& peerId, const std::string
 
 void DataChannelClient::close() {
     Log::info("[DataChannelClient] Cleaning up...");
+    stopGStreamerPipeline(); // 先停媒体
+    
     for (auto& [id, client] : m_clients) {
         if (client->dataChannel.has_value() && client->dataChannel.value()) {
             client->dataChannel.value()->close();
@@ -867,10 +911,7 @@ void DataChannelClient::close() {
     }
     m_clients.clear();
     m_connectedFlag = false;
-    if (m_ws) {
-        m_ws->close();
-        m_ws.reset();
-    }
+    if (m_ws) { m_ws->close(); m_ws.reset(); }
 }
 
 std::string DataChannelClient::getLocalId() const {
@@ -1106,148 +1147,6 @@ std::shared_ptr<ClientTrackData> DataChannelClient::addVideo(const std::shared_p
 
 
 
-/// Start stream
-void DataChannelClient::startStream() {
-    std::shared_ptr<Stream> stream;
-    if (m_avStream.has_value()) {
-        stream = m_avStream.value();
-        if (stream->isRunning) {
-            // stream is already running
-            return;
-        }
-    } else {
-        stream = createStream("../../samples/h264", 30, "../../samples/opus");
-        m_avStream = stream;
-    }
-    stream->start();
-}
-
-/// Add client to stream
-/// @param client Client
-/// @param adding_video True if adding video
-void DataChannelClient::addToStream(std::shared_ptr<Client> client, bool isAddingVideo) {
-    if (client->getState() == Client::State::Waiting) {
-        client->setState(isAddingVideo ? Client::State::WaitingForAudio : Client::State::WaitingForVideo);
-    } else if ((client->getState() == Client::State::WaitingForAudio && !isAddingVideo)
-               || (client->getState() == Client::State::WaitingForVideo && isAddingVideo)) {
-
-        // Audio and video tracks are collected now
-        assert(client->video.has_value() && client->audio.has_value());
-        auto video = client->video.value();
-
-        if (m_avStream.has_value()) {
-            sendInitialNalus(m_avStream.value(), video);
-        }
-
-        client->setState(Client::State::Ready);
-    }
-    if (client->getState() == Client::State::Ready) {
-        startStream();
-    }
-}
-
-// void DataChannelClient::addToStream(std::shared_ptr<Client> client, bool isAddingVideo) {
-//     // -------------------------------------------------------------------------
-//     // ✅ 修改点1：只要是添加视频，就直接进入 Ready 状态
-//     // -------------------------------------------------------------------------
-//     if (isAddingVideo) {
-//         // 确保视频 Track 存在
-//         assert(client->video.has_value());
-//         auto video = client->video.value();
-
-//         // 发送关键帧（如果流已创建）
-//         if (m_avStream.has_value()) {
-//             sendInitialNalus(m_avStream.value(), video);
-//         }
-
-//         // 直接设置为 Ready 状态
-//         client->setState(Client::State::Ready);
-//         Log::info("[DataChannelClient] Video track added, state set to Ready (audio optional)");
-//     }
-
-//     // -------------------------------------------------------------------------
-//     // ✅ 修改点2：只要状态是 Ready，就启动流
-//     // -------------------------------------------------------------------------
-//     if (client->getState() == Client::State::Ready) {
-//         startStream();
-//     }
-// }
-
-
-/// Create stream
-std::shared_ptr<Stream> DataChannelClient::createStream(
-    const std::string h264Samples, 
-    const unsigned fps, 
-    const std::string opusSamples) {
-    // video source
-    auto video = std::make_shared<H264FileParser>(h264Samples, fps, true);
-    // audio source
-    auto audio = std::make_shared<OPUSFileParser>(opusSamples, true);
-
-    auto stream = std::make_shared<Stream>(video, audio);
-    // set callback responsible for sample sending
-    stream->onSample([this, ws = make_weak_ptr(stream)](Stream::StreamSourceType type, uint64_t sampleTime, rtc::binary sample) {
-        std::vector<ClientTrack> tracks{};
-        std::string streamType = type == Stream::StreamSourceType::Video ? "video" : "audio";
-        // get track for given type
-        std::function<std::optional<std::shared_ptr<ClientTrackData>> (std::shared_ptr<Client>)> getTrackData = [type](std::shared_ptr<Client> client) {
-            return type == Stream::StreamSourceType::Video ? client->video : client->audio;
-        };
-        // get all clients with Ready state
-        for(auto id_client: m_clients) {
-            auto id = id_client.first;
-            auto client = id_client.second;
-            auto optTrackData = getTrackData(client);
-            if (client->getState() == Client::State::Ready && optTrackData.has_value()) {
-                auto trackData = optTrackData.value();
-                tracks.push_back(ClientTrack(id, trackData));
-            }
-        }
-        if (!tracks.empty()) {
-            for (auto clientTrack: tracks) {
-                auto client = clientTrack.id;
-                auto trackData = clientTrack.trackData;
-
-                std::cout << "Sending " << streamType << " sample with size: " << std::to_string(sample.size()) << " to " << client << std::endl;
-                try {
-                    // send sample
-                    trackData->track->sendFrame(sample, std::chrono::duration<double, std::micro>(sampleTime));
-                } catch (const std::exception &e) {
-                    std::cerr << "Unable to send "<< streamType << " packet: " << e.what() << std::endl;
-                }
-            }
-        }
-        m_MainThread.dispatch([this,ws]() {
-            if (m_clients.empty()) {
-                // we have no clients, stop the stream
-                if (auto stream = ws.lock()) {
-                    stream->stop();
-                }
-            }
-        });
-    });
-    return stream;
-}
-
-
-/// Send previous key frame so browser can show something to user
-/// @param stream Stream
-/// @param video Video track data
-void DataChannelClient::sendInitialNalus(std::shared_ptr<Stream> stream, std::shared_ptr<ClientTrackData> video) {
-    auto h264 = dynamic_cast<H264FileParser *>(stream->video.get());
-    auto initialNalus = h264->initialNALUS();
-
-    // send previous NALU key frame so users don't have to wait to see stream works
-    if (!initialNalus.empty()) {
-        const double frameDuration_s = double(h264->getSampleDuration_us()) / (1000 * 1000);
-        const uint32_t frameTimestampDuration = video->sender->rtpConfig->secondsToTimestamp(frameDuration_s);
-        video->sender->rtpConfig->timestamp = video->sender->rtpConfig->startTimestamp - frameTimestampDuration * 2;
-        video->track->send(initialNalus);
-        video->sender->rtpConfig->timestamp += frameTimestampDuration;
-        // Send initial NAL units again to start stream in firefox browser
-        video->track->send(initialNalus);
-    }
-}
 
 
 uint32_t DataChannelClient::generateUniqueSSRC(const std::string& clientId) {
@@ -1288,6 +1187,404 @@ std::shared_ptr<ClientTrackData> DataChannelClient::addAudio(const std::shared_p
     track->onOpen(onOpen);
     auto trackData = std::make_shared<ClientTrackData>(track, srReporter);
     return trackData;
+}
+//---------------GStreamer--------------------------
+// 前置声明：探针回调函数
+static GstPadProbeReturn H264DataProbe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data);
+
+// --- 启动 Linux GStreamer 实时采集 Pipeline ---
+void DataChannelClient::startGStreamerPipeline() {
+    if (m_gstRunning.exchange(true)) {
+        Log::warn("[GStreamer] Pipeline already running");
+        return;
+    }
+
+    m_shouldStop = false;
+    m_senderThread = std::thread(&DataChannelClient::senderLoop, this);
+    m_firstPts = 0;
+    Log::info("[GStreamer] Creating pipeline...");
+
+    m_firstPts = 0;
+
+    Log::info("[GStreamer] Creating pipeline...");
+
+    // ✅ 修复1：给关键元素命名 name=xxx （必须！）
+    // ✅ 修复2：简化管道，去掉JPEG解码（兼容性更强，绝大多数摄像头通用）
+    // const char* pipelineDesc = R"(
+    //     v4l2src device=/dev/video0 name=video_src ! 
+    //     video/x-raw,width=640,height=480,framerate=30/1 ! 
+    //     queue leaky=downstream max-size-buffers=1 ! 
+    //     x264enc name=h264_encoder tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 ! 
+    //     video/x-h264,stream-format=byte-stream,alignment=au ! 
+    //     appsink name=video_sink emit-signals=true sync=false
+    // )";
+
+    // const char* pipelineDesc = R"(
+    //     v4l2src device=/dev/video0 name=video_src ! 
+    //     image/jpeg,width=640,height=480,framerate=30/1 ! 
+    //     jpegdec ! 
+    //     videoconvert ! 
+    //     queue leaky=downstream max-size-buffers=1 ! 
+    //     x264enc name=h264_encoder tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 ! 
+    //     video/x-h264,stream-format=byte-stream,alignment=au ! 
+    //     appsink name=video_sink emit-signals=true sync=false
+    // )";
+
+    const char* pipelineDesc = R"(
+        v4l2src device=/dev/video0 name=video_src ! 
+        image/jpeg,width=640,height=480,framerate=30/1 ! 
+        jpegdec ! 
+        videoconvert ! 
+        queue leaky=downstream max-size-buffers=1 ! 
+        x264enc name=h264_encoder tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 bframes=0 ! 
+        h264parse,config-interval=1 ! 
+        video/x-h264,stream-format=avc,alignment=au ! 
+        appsink name=video_sink emit-signals=true sync=false
+    )";
+
+    GError* error = nullptr;
+    m_gstPipeline = gst_parse_launch(pipelineDesc, &error);
+    if (error) {
+        Log::error("[GStreamer] Failed to parse pipeline: {}", error->message);
+        g_error_free(error);
+        m_gstRunning = false;
+        return;
+    }
+    Log::info("[GStreamer] Pipeline parsed successfully.");
+
+    // ==========================================
+    // ✅ 修复2：用正确的name获取元素（和pipeline里的name一致）
+    // ==========================================
+    GstElement* src = gst_bin_get_by_name(GST_BIN(m_gstPipeline), "video_src");
+    GstElement* encoder = gst_bin_get_by_name(GST_BIN(m_gstPipeline), "h264_encoder");
+    m_gstAppSink = gst_bin_get_by_name(GST_BIN(m_gstPipeline), "video_sink");
+
+    if (!src || !encoder || !m_gstAppSink) {
+        Log::error("[GStreamer] Failed to find elements! src={}, encoder={}, appsink={}", 
+                  (src!=nullptr), (encoder!=nullptr), (m_gstAppSink!=nullptr));
+        if (src) gst_object_unref(src);
+        if (encoder) gst_object_unref(encoder);
+        gst_object_unref(m_gstPipeline);
+        m_gstPipeline = nullptr;
+        m_gstRunning = false;
+        return;
+    }
+    Log::info("[GStreamer] All elements found (src, encoder, sink).");
+
+    // ==========================================
+    // 数据探针（监控编码器输出）
+    // ==========================================
+    GstPad* encoder_src_pad = gst_element_get_static_pad(encoder, "src");
+    if (encoder_src_pad) {
+        gst_pad_add_probe(encoder_src_pad, GST_PAD_PROBE_TYPE_BUFFER, 
+            H264DataProbe, this, nullptr);
+        gst_object_unref(encoder_src_pad);
+        Log::info("[GStreamer] Probe attached to encoder output.");
+    }
+
+    // ==========================================
+    // GStreamer 总线错误监听（核心调试日志）
+    // ==========================================
+    GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(m_gstPipeline));
+    gst_bus_add_watch(bus, [](GstBus* bus, GstMessage* msg, gpointer user_data) -> gboolean {
+        auto* self = static_cast<DataChannelClient*>(user_data);
+        switch (GST_MESSAGE_TYPE(msg)) {
+            case GST_MESSAGE_ERROR: {
+                GError* err;
+                gchar* debug;
+                gst_message_parse_error(msg, &err, &debug);
+                Log::error("[GStreamer] BUS ERROR: {} | Debug: {}", err->message, debug ? debug : "none");
+                g_error_free(err);
+                g_free(debug);
+                break;
+            }
+            case GST_MESSAGE_WARNING: {
+                GError* err;
+                gchar* debug;
+                gst_message_parse_warning(msg, &err, &debug);
+                Log::warn("[GStreamer] BUS WARNING: {}", err->message);
+                g_error_free(err);
+                g_free(debug);
+                break;
+            }
+            case GST_MESSAGE_EOS:
+                Log::info("[GStreamer] BUS: End of Stream");
+                break;
+            case GST_MESSAGE_STATE_CHANGED:
+                if (GST_MESSAGE_SRC(msg) == GST_OBJECT(self->m_gstPipeline)) {
+                    GstState old_s, new_s, pending;
+                    gst_message_parse_state_changed(msg, &old_s, &new_s, &pending);
+                    Log::info("[GStreamer] State: {} -> {}", 
+                              gst_element_state_get_name(old_s), gst_element_state_get_name(new_s));
+                }
+                break;
+            default:
+                break;
+        }
+        return TRUE;
+    }, this);
+    gst_object_unref(bus);
+
+    // ==========================================
+    // 配置 appsink 回调
+    // ==========================================
+    GstAppSinkCallbacks callbacks{};
+    callbacks.new_sample = onNewSample;
+    gst_app_sink_set_callbacks(GST_APP_SINK(m_gstAppSink), &callbacks, this, nullptr);
+    Log::info("[GStreamer] Appsink callback set.");
+
+    // ==========================================
+    // 启动管道
+    // ==========================================
+    GstStateChangeReturn ret = gst_element_set_state(m_gstPipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        Log::error("[GStreamer] Failed to start PLAYING state!");
+        gst_object_unref(src);
+        gst_object_unref(encoder);
+        gst_object_unref(m_gstAppSink);
+        gst_object_unref(m_gstPipeline);
+        m_gstPipeline = m_gstAppSink = nullptr;
+        m_gstRunning = false;
+        return;
+    }
+
+    // 释放临时引用
+    gst_object_unref(src);
+    gst_object_unref(encoder);
+
+    Log::info("[GStreamer] ✅ Pipeline STARTED SUCCESSFULLY! Waiting for camera data...");
+}
+
+// ==========================================
+// 探针回调：打印编码器数据（调试用）
+// ==========================================
+static GstPadProbeReturn H264DataProbe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
+        GstBuffer *buffer = gst_pad_probe_info_get_buffer(info);
+        if (buffer) {
+            // 打印：编码器正常输出H264数据
+            gsize size = gst_buffer_get_size(buffer);
+            g_print("[GStreamer] Probe: H264 Frame Size = %zu bytes\n", size);
+        }
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+// ==========================================
+// appsink 核心回调：获取H264数据发给WebRTC
+// ==========================================
+GstFlowReturn DataChannelClient::onNewSample(GstAppSink* sink, gpointer user_data) {
+    auto* self = static_cast<DataChannelClient*>(user_data);
+    
+    if (!self->m_gstRunning) return GST_FLOW_OK;
+
+    GstSample* sample = gst_app_sink_pull_sample(sink);
+    if (!sample) return GST_FLOW_OK;
+    
+    GstBuffer* buffer = gst_sample_get_buffer(sample);
+    if (!buffer) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    GstMapInfo map;
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    // 1. 计算时间戳
+    GstClockTime pts = GST_BUFFER_PTS(buffer);
+    uint64_t timestamp_us = 0;
+    if (pts == GST_CLOCK_TIME_NONE) {
+        pts = g_get_monotonic_time() * 1000; 
+    }
+    if (self->m_firstPts == 0) {
+        self->m_firstPts = pts;
+        timestamp_us = 0;
+    } else {
+        timestamp_us = (pts - self->m_firstPts) / 1000;
+    }
+    
+    // 2. 封装数据
+    rtc::binary frame_data(reinterpret_cast<std::byte*>(map.data), 
+                           reinterpret_cast<std::byte*>(map.data + map.size));
+
+    // 3. 简单检测是否为关键帧 (IDR) 并缓存
+    // 逻辑：检查 Annex-B 流中是否包含 0x67 (SPS), 0x68 (PPS), 0x65 (IDR)
+    bool isIdr = false;
+    // 这里做一个简易的扫描，实际生产可以用更严谨的 H264 解析库
+    if (frame_data.size() > 5) {
+        // 简单判断：如果包含 0x65 (IDR) 或者 0x67 (SPS)，我们认为需要缓存
+        // 注意：这只是一个启发式判断
+        size_t offset = 0;
+
+        while (offset + 4 <= frame_data.size()) {
+            // 1. 读取 NALU 长度（大端）
+            uint32_t nal_size =
+                (uint32_t(frame_data[offset]) << 24) |
+                (uint32_t(frame_data[offset + 1]) << 16) |
+                (uint32_t(frame_data[offset + 2]) << 8) |
+                (uint32_t(frame_data[offset + 3]));
+
+            offset += 4;
+
+            if (offset + nal_size > frame_data.size()) {
+                break; // 防御
+            }
+
+            // 2. 读取 NAL header
+            uint8_t nal_header = uint8_t(frame_data[offset]);
+            uint8_t nal_type = nal_header & 0x1F;
+
+            // ===== 判断类型 =====
+            if (nal_type == 7 || nal_type == 8) {
+                // SPS / PPS
+                std::lock_guard<std::mutex> lock(self->m_cacheMutex);
+                self->m_cachedSpsPps = frame_data;
+            }
+
+            if (nal_type == 5) {
+                // IDR
+                isIdr = true;
+                std::lock_guard<std::mutex> lock(self->m_cacheMutex);
+                self->m_cachedIdr = frame_data;
+                self->m_cachedIdrTs = timestamp_us;
+            }
+
+            offset += nal_size;
+        }
+    }
+
+    // 4. 入队
+    self->m_frameQueue.push({std::move(frame_data), timestamp_us, isIdr});
+
+    // 5. 释放
+    gst_buffer_unmap(buffer, &map);
+    gst_sample_unref(sample);
+    
+    Log::debug("[GStreamer] Frame Captured, size={}, ts={}us, IDR={}", 
+               frame_data.size(), timestamp_us, isIdr);
+    return GST_FLOW_OK;
+}
+
+
+void DataChannelClient::sendCachedDataToNewClient(std::shared_ptr<ClientTrackData> newClientTrack) {
+    std::lock_guard<std::mutex> lock(m_cacheMutex);
+    
+    // 注意：这里直接发送，不经过队列，因为是给特定客户端的
+    try {
+        if (!m_cachedSpsPps.empty()) {
+            rtc::FrameInfo info(0);
+            // 缓存的时间戳可以设为 0 或稍微往前一点
+            newClientTrack->track->sendFrame(m_cachedSpsPps, info);
+            Log::info("[DataChannelClient] Sent cached SPS/PPS to new client");
+        }
+        if (!m_cachedIdr.empty()) {
+            // 计算 RTP 时间戳
+            uint32_t rtp_ts = static_cast<uint32_t>(m_cachedIdrTs * 90 / 1000);
+            rtc::FrameInfo info(rtp_ts);
+
+            newClientTrack->track->sendFrame(m_cachedIdr, info);
+            Log::info("[DataChannelClient] Sent cached IDR to new client");
+        }
+    } catch (const std::exception& e) {
+        Log::error("[DataChannelClient] Failed to send cache: {}", e.what());
+    }
+}
+
+// ==========================================
+// 停止管道
+// ==========================================
+void DataChannelClient::stopGStreamerPipeline() {
+    if (!m_gstRunning.exchange(false)) return;
+    Log::info("[GStreamer] Stopping...");
+
+    // 1. 停止队列
+    m_frameQueue.stop();
+
+    // 2. 停止线程
+    m_shouldStop = true;
+    if (m_senderThread.joinable()) {
+        m_senderThread.join();
+    }
+
+    // 3. 停止 GStreamer
+    if (m_gstPipeline) {
+        gst_element_set_state(m_gstPipeline, GST_STATE_NULL);
+        gst_object_unref(m_gstPipeline);
+        m_gstPipeline = nullptr;
+    }
+    m_gstAppSink = nullptr;
+    
+    // 4. 清空缓存
+    {
+        std::lock_guard<std::mutex> lock(m_cacheMutex);
+        m_cachedSpsPps.clear();
+        m_cachedIdr.clear();
+    }
+
+    m_firstPts = 0; 
+}
+
+
+//-------------------------------
+void DataChannelClient::enqueueFrame(rtc::binary data, uint64_t ts_us) {
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    // 可选：如果队列积压太多，丢帧 (防止内存爆炸)
+    if (m_frameQueue.size() > 10) {
+        Log::warn("[GStreamer] Queue overflow, dropping frame");
+        return; 
+    }
+    m_frameQueue.push({std::move(data), ts_us});
+    m_queueCv.notify_one();
+}
+void DataChannelClient::senderLoop() {
+    Log::info("[Sender] Thread started");
+    while (!m_shouldStop) {
+        // 使用现成的 BlockingQueue
+        auto frame = m_frameQueue.waitAndPop();
+        
+        if (m_shouldStop) break;
+        if (frame.data.empty()) continue;
+
+        // 遍历所有客户端
+        std::vector<std::shared_ptr<Client>> activeClients;
+        {
+            // 这里最好给 m_clients 也加个锁，如果在其他地方有修改的话
+            // 假设 m_clients 主要在主线程操作，这里只读，问题不大
+            for (auto& [id, client] : m_clients) {
+                 if (client->video) {
+                     activeClients.push_back(client);
+                 }
+            }
+        }
+
+        if (activeClients.empty()) continue;
+
+        // 计算 RTP 时间戳
+        uint32_t rtp_ts = static_cast<uint32_t>(frame.timestamp_us * 90 / 1000); 
+
+        for (auto& client : activeClients) {
+            try {
+                rtc::FrameInfo info(rtp_ts);
+                
+                
+                // 发送
+                client->video.value()->track->sendFrame(frame.data, info);
+                
+                // 【重要】更新 RTCP SR 报告器
+                // 这会让接收端看到正确的 NTP 时间戳
+                client->video.value()->sender->rtpConfig->timestamp = rtp_ts;
+                // 注意：如果需要非常精确的 NTP  wallclock time，还需要更新 lastWallClockTime
+                // 这里简化处理，libdatachannel 内部通常会在调用 sendFrame 时处理部分逻辑，但显式更新 timestamp 是好的实践
+                
+            } catch (const std::exception& e) {
+                Log::error("[Sender] Failed to send to client: {}", e.what());
+            }
+        }
+    }
+    Log::info("[Sender] Thread stopped");
 }
 ========== ./stream.cpp ==========
 Lines: 110
@@ -1404,7 +1701,7 @@ void Stream::stop() {
 
 
 ========== ./utilities/blocking_queue.h ==========
-Lines: 57
+Lines: 68
 
 #pragma once
 #include <queue>
@@ -1456,10 +1753,21 @@ public:
         return item;
     }
 
+    size_t size() const {
+        // 注意：因为 size() 是 const 函数，所以 m_mutex 必须声明为 mutable
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_queue.size();
+    }
+
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_queue.empty();
+    }
+
 private:
 
     std::queue<T> m_queue;
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     std::atomic<bool> m_stop;
 };
@@ -1571,4 +1879,4 @@ public:
 
 =====================================
 Total files: 12
-Total lines: 1504
+Total lines: 1812

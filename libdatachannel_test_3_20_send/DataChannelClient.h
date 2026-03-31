@@ -10,11 +10,16 @@
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 #include "utilities/log.h"
 #include "h264fileparser.hpp"
 #include "helpers.hpp"
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
+#include "utilities/blocking_queue.h"
+#include "FrameSource.h"
 class DataChannelClient {
 public:
     using OnConnectedCallback = std::function<void(const std::string& peerId)>;
@@ -96,7 +101,7 @@ private:
 
 
     // --- GStreamer 桥接层 ---
-    void startGStreamerPipeline(std::optional<std::shared_ptr<ClientTrackData>> videoTrack);
+    void startGStreamerPipeline();
     void stopGStreamerPipeline();
     static GstFlowReturn onNewSample(GstAppSink* sink, gpointer user_data);
     // --- GStreamer 成员变量 ---
@@ -105,4 +110,26 @@ private:
     std::shared_ptr<ClientTrackData> m_currentVideoTrack;
     uint64_t m_firstPts = 0;
     std::atomic<bool> m_gstRunning{false};
+
+
+
+
+
+    struct VideoFrame {
+        rtc::binary data;
+        uint64_t timestamp_us;
+        bool isIdr; // 标记是否为关键帧
+    };
+    BlockingQueue<VideoFrame> m_frameQueue;
+    std::mutex m_cacheMutex;
+    rtc::binary m_cachedSpsPps;
+    rtc::binary m_cachedIdr;
+    uint64_t m_cachedIdrTs = 0;
+    std::mutex m_queueMutex;
+    std::condition_variable m_queueCv;
+    std::thread m_senderThread;
+    std::atomic<bool> m_shouldStop{false};
+    void enqueueFrame(rtc::binary data, uint64_t ts_us);
+    void senderLoop(); 
+    void sendCachedDataToNewClient(std::shared_ptr<ClientTrackData> newClientTrack);
 };

@@ -42,7 +42,8 @@ struct Client {
     State getState();
 
     uint32_t rtpStartTimestamp = 0;
-
+    
+    bool hasReceivedKeyframe = false; 
 private:
     mutable std::shared_mutex _mutex;
     State state = State::Waiting;

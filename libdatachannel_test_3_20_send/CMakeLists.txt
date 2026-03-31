@@ -26,6 +26,9 @@ set(PROJECT_SOURCES
     stream.hpp
     ArgParser.cpp
     ArgParser.hpp
+    FrameSource.h
+    FrameSource.cpp
+    MediaFrame.h
 )
 
 # =========================
