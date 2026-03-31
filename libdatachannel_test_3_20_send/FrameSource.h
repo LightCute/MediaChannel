@@ -40,7 +40,7 @@ private:
 
     // 解析 H.264 并更新缓存
     void parseAndCacheNalus(const rtc::binary& data, VideoFrame& frame);
-
+    void debugH264(const rtc::binary& data);
     // 成员变量
     FrameCallback m_callback;
     std::atomic<bool> m_running;

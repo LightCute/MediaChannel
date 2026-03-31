@@ -3,7 +3,11 @@
 #include "utilities/log.h"
 #include <gst/gst.h>
 
-// 静态帧计数器（用于日志打印）
+static uint64_t s_videoPts = 0;
+// 30fps 每帧间隔：90000 / 30 = 3000
+const uint64_t VIDEO_FRAME_STEP = 3000;
+const uint32_t VIDEO_CLOCK = 90000;
+
 static int frame_cnt = 0;
 
 GstMediaPlayer::GstMediaPlayer() 
@@ -35,9 +39,9 @@ bool GstMediaPlayer::start() {
     std::string pipelineDesc = 
         // 视频支路 + 探针
         "appsrc name=video_src emit-signals=false is-live=true ! "
-        "queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! "
+        "queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 leaky=downstream ! "
         "identity silent=false name=probe1 ! "  // 探针1：appsrc输出
-        "h264parse ! "
+        "h264parse config-interval=1 ! "
         "avdec_h264 ! "
         "identity silent=false name=probe2 ! "  // 探针2：解析后数据
         "videoconvert ! autovideosink sync=false "
@@ -46,7 +50,7 @@ bool GstMediaPlayer::start() {
         "appsrc name=audio_src emit-signals=false is-live=true ! "
         "queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! "
         "opusparse ! opusdec ! audioconvert ! audioresample ! autoaudiosink sync=false ";
-
+        
     Log::debug("[GstMediaPlayer] Pipeline desc: {}", pipelineDesc);
 
     GError* error = nullptr;
@@ -76,7 +80,11 @@ bool GstMediaPlayer::start() {
     GstCaps* videoCaps = gst_caps_from_string(
         "video/x-h264, stream-format=byte-stream, alignment=au"
     );
-    g_object_set(m_appsrcVideo, "caps", videoCaps, nullptr);
+    g_object_set(m_appsrcVideo,
+        "is-live", TRUE,
+        "block", FALSE,   // 🔥关键
+        "format", GST_FORMAT_TIME,
+        nullptr);
     gst_caps_unref(videoCaps);
 
     // ===================== 设置音频 Caps =====================
@@ -112,6 +120,7 @@ bool GstMediaPlayer::start() {
     gst_bus_add_watch(bus, (GstBusFunc)GstMediaPlayer::onGstMessage, this);
     gst_object_unref(bus);
 
+    s_videoPts = 0;// 🔥 重置时间戳
     m_isRunning = true;
     Log::info("[GstMediaPlayer] Started successfully (A/V Sync disabled for testing)");
     return true;
@@ -197,7 +206,24 @@ void GstMediaPlayer::stop() {
 
 void GstMediaPlayer::pushVideoFrame(rtc::binary data, uint32_t timestamp) {
     if (!m_isRunning || !m_appsrcVideo) return;
-    pushToAppSrc(m_appsrcVideo, data, timestamp, 90000);
+
+    GstBuffer* buf = gst_buffer_new_memdup(data.data(), data.size());
+    // ✅ 核心：使用自增PTS，严格递增
+    GST_BUFFER_PTS(buf) = s_videoPts * GST_USECOND;
+    GST_BUFFER_DTS(buf) = GST_BUFFER_PTS(buf);
+
+    GstFlowReturn ret;
+    g_signal_emit_by_name(m_appsrcVideo, "push-buffer", buf, &ret);
+
+    if (ret == GST_FLOW_OK) {
+        Log::trace("[GstMediaPlayer] Pushed H264 frame, size={}, pts={}", data.size(), s_videoPts);
+        // 时间戳自增
+        s_videoPts += VIDEO_FRAME_STEP;
+    } else {
+        Log::error("[GstMediaPlayer] Push failed! ret={}", (int)ret);
+    }
+
+    gst_buffer_unref(buf);
 }
 
 void GstMediaPlayer::pushAudioFrame(rtc::binary data, uint32_t timestamp) {
@@ -207,24 +233,12 @@ void GstMediaPlayer::pushAudioFrame(rtc::binary data, uint32_t timestamp) {
 
 // 增强版 数据推送函数（带完整日志）
 void GstMediaPlayer::pushToAppSrc(GstElement* appsrc, const rtc::binary& data, uint32_t ts, uint32_t clock) {
-    if (!appsrc || data.empty()) {
-        Log::warn("[GstMediaPlayer] pushToAppSrc: invalid data");
-        return;
-    }
-
+    if (!appsrc || data.empty()) return;
     GstBuffer* buf = gst_buffer_new_memdup(data.data(), data.size());
     GST_BUFFER_PTS(buf) = (uint64_t)ts * GST_SECOND / clock;
     GST_BUFFER_DTS(buf) = GST_BUFFER_PTS(buf);
 
     GstFlowReturn ret;
     g_signal_emit_by_name(appsrc, "push-buffer", buf, &ret);
-    
-    // ✅ 添加日志，验证推送结果
-    if (ret == GST_FLOW_OK) {
-        Log::trace("[GstMediaPlayer] Pushed buffer size={}, ts={}", data.size(), ts);
-    } else {
-        Log::error("[GstMediaPlayer] Push buffer failed, ret={}", (int)ret);
-    }
-
     gst_buffer_unref(buf);
 }

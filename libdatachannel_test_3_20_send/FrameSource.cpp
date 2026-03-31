@@ -213,6 +213,7 @@ GstFlowReturn FrameSource::onNewSample(GstAppSink* sink) {
     }
     Log::debug("[FrameSource] Captured frame: size={}, isIdr={}", map.size, frame.isIdr);
     // 4. 推送回调 (注意：这里是在 GST 线程中调用的)
+    debugH264(frame.data);
     m_callback(frame);
 
     // 5. 清理
@@ -221,3 +222,65 @@ GstFlowReturn FrameSource::onNewSample(GstAppSink* sink) {
 
     return GST_FLOW_OK;
 }
+
+
+void FrameSource::debugH264(const rtc::binary& data) {
+    if (data.size() < 5) return;
+
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data.data());
+
+    int nalCount = 0;
+    int audCount = 0;
+    int sliceCount = 0;
+
+    uint8_t prevNal = 0xFF;
+
+    for (size_t i = 0; i < data.size() - 4; i++) {
+        if ((ptr[i]==0 && ptr[i+1]==0 && ptr[i+2]==1) ||
+            (ptr[i]==0 && ptr[i+1]==0 && ptr[i+2]==0 && ptr[i+3]==1)) {
+
+            size_t offset = (ptr[i+2]==1) ? 3 : 4;
+            uint8_t nal = ptr[i + offset] & 0x1F;
+
+            nalCount++;
+
+            Log::info("[FrameSource][NALU] type={}", nal);
+
+            switch(nal) {
+                case 9:
+                    Log::info("  -> (AUD)");
+                    audCount++;
+                    if (prevNal == 9) {
+                        Log::warn("continue AUD !!!!");
+                    }
+                    break;
+                case 7:
+                    Log::info("  -> (SPS)");
+                    break;
+                case 8:
+                    Log::info("  -> (PPS)");
+                    break;
+                case 5:
+                    Log::info("  -> (IDR slice)");
+                    sliceCount++;
+                    break;
+                case 1:
+                    Log::info("  -> (non-IDR slice)");
+                    sliceCount++;
+                    break;
+                default:
+                    Log::info("  -> (other)");
+                    break;
+            }
+
+            prevNal = nal;
+        }
+    }
+
+    Log::info("[FrameSource][SUMMARY] size={}, nalCount={}, audCount={}, sliceCount={}",
+              data.size(), nalCount, audCount, sliceCount);
+}
+
+
+
+
