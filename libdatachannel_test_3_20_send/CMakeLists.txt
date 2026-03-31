@@ -29,6 +29,8 @@ set(PROJECT_SOURCES
     FrameSource.h
     FrameSource.cpp
     MediaFrame.h
+    MediaRouter.h
+    MediaRouter.cpp
 )
 
 # =========================

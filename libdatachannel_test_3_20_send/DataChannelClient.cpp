@@ -28,6 +28,7 @@ DataChannelClient::DataChannelClient()
     );
     //m_config.iceServers.push_back(turnServer);
     m_frameSource = std::make_unique<FrameSource>();
+    m_mediaRouter = std::make_unique<MediaRouter>();
     m_frameSource->setCallback([this](const VideoFrame& frame) {
         // 这里的代码运行在 GStreamer 线程上
         // 你需要把 frame 放入队列，或者分发给所有 client
@@ -171,11 +172,7 @@ void DataChannelClient::callPeer(const std::string& peerId) {
 
     videoTrackData->track->onOpen([this, peerId, client, videoTrackData]() {
         Log::info("[DataChannelClient] Video track open for {}, starting GStreamer", peerId);
-        // ✅ 现在client->video 100%有值，传给GST
-        // 1. 尝试给新客户端发缓存的 SPS/PPS/IDR (快速出图)
-
-        // 2. 启动 GStreamer (如果还没启动的话)
-        // 注意：这里不再传 videoTrack 给 startGStreamerPipeline，因为我们是广播模式
+        m_mediaRouter->registerClient(videoTrackData);
         startGStreamerPipeline(); 
     });
     // client->audio = addAudio(pc, 111, audioSsrc, "audio-stream", "stream-" + peerId, [this, peerId, wc = make_weak_ptr(client)]() {
@@ -248,6 +245,9 @@ void DataChannelClient::sendMessage(const std::string& peerId, const std::string
 void DataChannelClient::close() {
     Log::info("[DataChannelClient] Cleaning up...");
     
+
+    m_frameSource->stop();
+    m_mediaRouter->stop();
     for (auto& [id, client] : m_clients) {
         if (client->dataChannel.has_value() && client->dataChannel.value()) {
             client->dataChannel.value()->close();

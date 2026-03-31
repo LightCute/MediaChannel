@@ -20,6 +20,7 @@
 #include <gst/app/gstappsink.h>
 #include "utilities/blocking_queue.h"
 #include "FrameSource.h"
+#include "MediaRouter.h"
 class DataChannelClient {
 public:
     using OnConnectedCallback = std::function<void(const std::string& peerId)>;
@@ -105,6 +106,7 @@ private:
     void onFrameReceived(const VideoFrame& frame);
     void startGStreamerPipeline();
 
+    std::unique_ptr<MediaRouter> m_mediaRouter;
 
     
     BlockingQueue<VideoFrame> m_frameQueue;
