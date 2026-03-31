@@ -199,8 +199,6 @@ GstFlowReturn FrameSource::onNewSample(GstAppSink* sink) {
     frame.timestamp_us = timestamp_us;
     frame.isIdr = false;
 
-    // 3. 解析 NALU 并缓存 SPS/PPS
-    parseAndCacheNalus(frame.data, frame);
 
     // 4. 推送回调 (注意：这里是在 GST 线程中调用的)
     m_callback(frame);
@@ -210,41 +208,4 @@ GstFlowReturn FrameSource::onNewSample(GstAppSink* sink) {
     gst_sample_unref(sample);
 
     return GST_FLOW_OK;
-}
-
-void FrameSource::parseAndCacheNalus(const rtc::binary& data, VideoFrame& frame) {
-    if (data.size() < 5) return;
-
-    size_t offset = 0;
-    // 这里的逻辑假设是 AVCC (长度前缀) 格式
-    // 如果你需要 Annex-B (00 00 00 01)，解析逻辑需要微调
-    while (offset + 4 <= data.size()) {
-        // 读取长度 (Big Endian)
-        uint32_t nal_size =
-            (uint32_t(data[offset]) << 24) |
-            (uint32_t(data[offset + 1]) << 16) |
-            (uint32_t(data[offset + 2]) << 8) |
-            (uint32_t(data[offset + 3]));
-
-        offset += 4;
-        if (offset + nal_size > data.size()) break;
-
-        uint8_t nal_header = uint8_t(data[offset]);
-        uint8_t nal_type = nal_header & 0x1F;
-
-        // 缓存 SPS (7) / PPS (8)
-        if (nal_type == 7 || nal_type == 8) {
-            std::lock_guard<std::mutex> lock(m_cacheMutex);
-            // 简单的全帧缓存策略：如果这一帧包含 SPS/PPS，缓存整帧
-            // 更精细的做法是只缓存 specific NALUs
-            m_cachedSpsPps = data; 
-        }
-
-        // 标记 IDR (5)
-        if (nal_type == 5) {
-            frame.isIdr = true;
-        }
-
-        offset += nal_size;
-    }
 }

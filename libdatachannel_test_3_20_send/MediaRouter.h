@@ -1,57 +1,50 @@
 #pragma once
-#include <memory>
+
 #include <vector>
+#include <queue>
 #include <mutex>
 #include <thread>
-#include <optional>
+#include <atomic>
+#include <condition_variable>
 #include "MediaFrame.h"
+#include <rtc/rtc.hpp>
 #include "helpers.hpp"
-#include "utilities/blocking_queue.h"
-#include "utilities/log.h"
 
 class MediaRouter {
 public:
-    MediaRouter() = default;
+    MediaRouter();
     ~MediaRouter();
 
-    // 启动/停止发送线程
     void start();
     void stop();
 
-    // 核心接口：接收帧（FrameSource 回调调用）
-    void onFrameReceived(const VideoFrame& frame);
+    void pushFrame(const VideoFrame& frame);
 
-    // 注册/注销客户端（新Peer连接时调用）
-    void registerClient(std::weak_ptr<ClientTrackData> clientTrack);
-    void unregisterClient(std::weak_ptr<ClientTrackData> clientTrack);
-
-    // 设置SPS/PPS缓存
-    void setSpsPps(const rtc::binary& spsPps);
+    void registerClient(std::shared_ptr<ClientTrackData> client);
+    void unregisterClient(std::shared_ptr<ClientTrackData> client);
 
 private:
-    // 发送线程主循环
     void senderLoop();
-    // 广播帧到所有客户端
-    void broadcastFrame(const VideoFrame& frame);
-    // 新客户端补帧（SPS/PPS/IDR）
-    void sendCachedDataToClient(std::shared_ptr<ClientTrackData> track);
-    // 更新IDR缓存
-    void updateIdrCache(const VideoFrame& frame);
+
+    void parseAndCache(const VideoFrame& frame);
 
 private:
-    std::atomic<bool> m_running{false};
-    std::thread m_senderThread;
-    BlockingQueue<VideoFrame> m_frameQueue;
-
-    // 客户端管理（弱指针，无循环引用）
+    std::vector<std::shared_ptr<ClientTrackData>> m_clients;
     std::mutex m_clientMutex;
-    std::vector<std::weak_ptr<ClientTrackData>> m_clientList;
 
-    // 缓存：补帧用
-    std::mutex m_cacheMutex;
-    rtc::binary m_cachedSpsPps;
-    VideoFrame m_cachedIdrFrame;
+    std::queue<VideoFrame> m_queue;
+    std::mutex m_queueMutex;
+    std::condition_variable m_cv;
 
-    // 队列保护：最大缓存帧数
-    static constexpr size_t MAX_QUEUE_SIZE = 10;
+    std::thread m_thread;
+    std::atomic<bool> m_running{false};
+
+
+
+    rtc::binary m_cachedSpsPps;  // 拼接后的SPS+PPS
+    rtc::binary m_cachedIdr;     // 缓存的IDR帧
+    uint64_t m_cachedIdrTs{0};   // IDR时间戳
+    rtc::binary m_sps;           // 单独SPS  【新增】
+    rtc::binary m_pps;           // 单独PPS  【新增】
+
 };

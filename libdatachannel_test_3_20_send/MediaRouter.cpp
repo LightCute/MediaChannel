@@ -1,4 +1,7 @@
 #include "MediaRouter.h"
+#include <algorithm>
+
+MediaRouter::MediaRouter() {}
 
 MediaRouter::~MediaRouter() {
     stop();
@@ -6,113 +9,152 @@ MediaRouter::~MediaRouter() {
 
 void MediaRouter::start() {
     if (m_running.exchange(true)) return;
-    m_senderThread = std::thread(&MediaRouter::senderLoop, this);
-    Log::info("[MediaRouter] 发送线程启动");
+
+    m_thread = std::thread(&MediaRouter::senderLoop, this);
 }
 
 void MediaRouter::stop() {
     if (!m_running.exchange(false)) return;
-    m_frameQueue.stop();
-    if (m_senderThread.joinable()) m_senderThread.join();
-    Log::info("[MediaRouter] 发送线程停止");
+
+    m_cv.notify_all();
+    if (m_thread.joinable()) m_thread.join();
 }
 
-void MediaRouter::setSpsPps(const rtc::binary& spsPps) {
-    std::lock_guard<std::mutex> lock(m_cacheMutex);
-    m_cachedSpsPps = spsPps;
-}
+void MediaRouter::pushFrame(const VideoFrame& frame) {
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
 
-void MediaRouter::updateIdrCache(const VideoFrame& frame) {
-    if (frame.isIdr) {
-        std::lock_guard<std::mutex> lock(m_cacheMutex);
-        m_cachedIdrFrame = frame;
-    }
-}
-
-void MediaRouter::onFrameReceived(const VideoFrame& frame) {
-    if (!m_running) return;
-
-    // 更新IDR缓存
-    updateIdrCache(frame);
-
-    // 队列保护，丢帧防内存溢出
-    if (m_frameQueue.size() > MAX_QUEUE_SIZE) {
-        Log::warn("[MediaRouter] 队列溢出，丢弃帧");
-        return;
-    }
-
-    // 入队
-    m_frameQueue.push(frame);
-}
-
-void MediaRouter::registerClient(std::weak_ptr<ClientTrackData> clientTrack) {
-    std::lock_guard<std::mutex> lock(m_clientMutex);
-    m_clientList.emplace_back(clientTrack);
-
-    // 新客户端立即补帧
-    if (auto track = clientTrack.lock()) {
-        sendCachedDataToClient(track);
-    }
-}
-
-void MediaRouter::unregisterClient(std::weak_ptr<ClientTrackData> clientTrack) {
-    std::lock_guard<std::mutex> lock(m_clientMutex);
-    for (auto it = m_clientList.begin(); it != m_clientList.end();) {
-        if (it->lock() == clientTrack.lock()) {
-            it = m_clientList.erase(it);
-        } else {
-            ++it;
+        // 🔥 丢帧策略（关键）
+        if (m_queue.size() > 10) {
+            // 丢掉旧帧（保持实时）
+            m_queue.pop();
         }
+
+        m_queue.push(frame);
     }
+    m_cv.notify_one();
 }
 
-void MediaRouter::sendCachedDataToClient(std::shared_ptr<ClientTrackData> track) {
-    std::lock_guard<std::mutex> lock(m_cacheMutex);
+void MediaRouter::registerClient(std::shared_ptr<ClientTrackData> client) {
+    std::lock_guard<std::mutex> lock(m_clientMutex);
+    m_clients.push_back(client);
+
+    // 🔥 新客户端立即补 SPS/PPS + IDR
     try {
-        // 发送SPS/PPS
         if (!m_cachedSpsPps.empty()) {
-            rtc::FrameInfo info(0);
-            track->track->sendFrame(m_cachedSpsPps, info);
-            Log::info("[MediaRouter] 发送缓存SPS/PPS给新客户端");
+            client->track->sendFrame(m_cachedSpsPps, rtc::FrameInfo(0));
         }
-        // 发送IDR帧
-        if (!m_cachedIdrFrame.data.empty()) {
-            uint32_t rtpTs = static_cast<uint32_t>(m_cachedIdrFrame.timestamp_us * 90 / 1000);
-            rtc::FrameInfo info(rtpTs);
-            track->track->sendFrame(m_cachedIdrFrame.data, info);
-            Log::info("[MediaRouter] 发送缓存IDR给新客户端");
+
+        if (!m_cachedIdr.empty()) {
+            uint32_t ts = static_cast<uint32_t>(m_cachedIdrTs * 90 / 1000);
+            client->track->sendFrame(m_cachedIdr, rtc::FrameInfo(ts));
         }
-    } catch (const std::exception& e) {
-        Log::error("[MediaRouter] 补帧失败: {}", e.what());
-    }
+    } catch (...) {}
 }
 
-void MediaRouter::broadcastFrame(const VideoFrame& frame) {
+void MediaRouter::unregisterClient(std::shared_ptr<ClientTrackData> client) {
     std::lock_guard<std::mutex> lock(m_clientMutex);
-    uint32_t rtpTs = static_cast<uint32_t>(frame.timestamp_us * 90 / 1000);
 
-    // 遍历并清理失效客户端
-    for (auto it = m_clientList.begin(); it != m_clientList.end();) {
-        if (auto track = it->lock()) {
-            try {
-                rtc::FrameInfo info(rtpTs);
-                track->track->sendFrame(frame.data, info);
-                track->sender->rtpConfig->timestamp = rtpTs;
-                ++it;
-            } catch (...) {
-                it = m_clientList.erase(it);
-            }
-        } else {
-            it = m_clientList.erase(it);
-        }
-    }
+    m_clients.erase(
+        std::remove(m_clients.begin(), m_clients.end(), client),
+        m_clients.end()
+    );
 }
 
 void MediaRouter::senderLoop() {
     while (m_running) {
-        auto frame = m_frameQueue.waitAndPop();
-        if (!m_running || frame.data.empty()) continue;
+        VideoFrame frame;
 
-        broadcastFrame(frame);
+        {
+            std::unique_lock<std::mutex> lock(m_queueMutex);
+            m_cv.wait(lock, [&]() {
+                return !m_running || !m_queue.empty();
+            });
+
+            if (!m_running) break;
+
+            frame = std::move(m_queue.front());
+            m_queue.pop();
+        }
+
+        if (frame.data.empty()) continue;
+
+        // 🔥 缓存 SPS / PPS / IDR
+        parseAndCache(frame);
+
+        // RTP 时间戳
+        uint32_t rtp_ts = static_cast<uint32_t>(frame.timestamp_us * 90 / 1000);
+
+        std::vector<std::shared_ptr<ClientTrackData>> clientsCopy;
+        {
+            std::lock_guard<std::mutex> lock(m_clientMutex);
+            clientsCopy = m_clients;
+        }
+
+        for (auto& client : clientsCopy) {
+            try {
+                rtc::FrameInfo info(rtp_ts);
+
+                client->track->sendFrame(frame.data, info);
+
+                // 更新 SR
+                client->sender->rtpConfig->timestamp = rtp_ts;
+
+            } catch (...) {}
+        }
+    }
+}
+
+void MediaRouter::parseAndCache(const VideoFrame& frame) {
+    const auto& data = frame.data;
+    if (data.size() < 5) return;
+
+    size_t offset = 0;
+    while (offset + 4 <= data.size()) {
+        // 读取AVCC格式的NAL长度(大端)
+        uint32_t size =
+            (static_cast<uint32_t>(data[offset])  << 24) |
+            (static_cast<uint32_t>(data[offset+1])<< 16) |
+            (static_cast<uint32_t>(data[offset+2])<< 8)  |
+            (static_cast<uint32_t>(data[offset+3]));
+
+        offset += 4;
+        if (offset + size > data.size()) break;
+
+        const uint8_t* nalu = reinterpret_cast<const uint8_t*>(data.data() + offset);
+        uint8_t nalType = nalu[0] & 0x1F;
+
+        // 构造单NALU包（带4字节长度头）
+        rtc::binary singleNalu(4 + size);
+
+        // ===================== 核心修复：std::byte 必须显式强转 =====================
+        singleNalu[0] = std::byte( (size >> 24) & 0xFF );
+        singleNalu[1] = std::byte( (size >> 16) & 0xFF );
+        singleNalu[2] = std::byte( (size >> 8)  & 0xFF );
+        singleNalu[3] = std::byte( size & 0xFF );
+
+        // 拷贝NALU数据
+        std::copy(nalu, nalu + size, reinterpret_cast<uint8_t*>(singleNalu.data() + 4));
+
+        // 缓存SPS/PPS/IDR
+        if (nalType == 7) {
+            m_sps = singleNalu;
+        }
+        else if (nalType == 8) {
+            m_pps = singleNalu;
+        }
+        else if (nalType == 5) {
+            m_cachedIdr = singleNalu;
+            m_cachedIdrTs = frame.timestamp_us;
+        }
+
+        offset += size;
+    }
+
+    // 拼接SPS+PPS，用于新客户端快速出图
+    if (!m_sps.empty() && !m_pps.empty()) {
+        m_cachedSpsPps.clear();
+        m_cachedSpsPps.insert(m_cachedSpsPps.end(), m_sps.begin(), m_sps.end());
+        m_cachedSpsPps.insert(m_cachedSpsPps.end(), m_pps.begin(), m_pps.end());
     }
 }
