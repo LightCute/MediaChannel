@@ -48,7 +48,7 @@ bool FrameSource::start() {
         t. ! queue leaky=downstream max-size-buffers=2 ! 
             x264enc tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=30 bframes=0 ! 
             h264parse config-interval=-1 ! 
-            video/x-h264,stream-format=avc,alignment=au ! 
+            video/x-h264,stream-format=byte-stream,alignment=au ! 
             appsink name=video_sink emit-signals=true sync=false
 
         t. ! queue ! 
@@ -198,7 +198,19 @@ GstFlowReturn FrameSource::onNewSample(GstAppSink* sink) {
                               reinterpret_cast<std::byte*>(map.data + map.size));
     frame.timestamp_us = timestamp_us;
     frame.isIdr = false;
-
+    if (map.size >= 5) {
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(map.data);
+        for (size_t i = 0; i < map.size - 4; i++) {
+            if ((ptr[i] == 0 && ptr[i+1] == 0 && ptr[i+2] == 0 && ptr[i+3] == 1) || 
+                (ptr[i] == 0 && ptr[i+1] == 0 && ptr[i+2] == 1)) {
+                uint8_t nal_type = ptr[i + (ptr[i+2]==1 ? 3 : 4)] & 0x1F;
+                if (nal_type == 5) {
+                    frame.isIdr = true;
+                    break;
+                }
+            }
+        }
+    }
 
     // 4. 推送回调 (注意：这里是在 GST 线程中调用的)
     m_callback(frame);

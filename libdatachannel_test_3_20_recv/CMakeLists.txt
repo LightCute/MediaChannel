@@ -28,6 +28,8 @@ set(PROJECT_SOURCES
     ThreadSafeQueue.h
     GstMediaPlayer.cpp
     GstMediaPlayer.h
+    MediaReceiver.h
+    MediaReceiver.cpp
 )
 
 # =========================

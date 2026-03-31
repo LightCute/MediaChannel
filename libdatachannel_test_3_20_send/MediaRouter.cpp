@@ -86,7 +86,6 @@ void MediaRouter::unregisterClient(std::shared_ptr<ClientTrackData> client) {
         Log::warn("[MediaRouter] Client not found for unregister");
     }
 }
-
 void MediaRouter::senderLoop() {
     Log::info("[MediaRouter] Sender loop running");
     while (m_running) {
@@ -99,101 +98,141 @@ void MediaRouter::senderLoop() {
             });
 
             if (!m_running) break;
-
             frame = std::move(m_queue.front());
             m_queue.pop();
-            //Log::debug("[MediaRouter] Popped frame from queue, size: {} bytes", frame.data.size());
         }
 
-        if (frame.data.empty()) {
-            Log::warn("[MediaRouter] Skipped empty frame");
-            continue;
-        }
+        if (frame.data.empty()) continue;
 
-        // 解析并缓存关键帧
+        // 1. 解析并缓存NALU（原有逻辑）
         parseAndCache(frame);
 
-        // RTP 时间戳
+        // 2. ✅ 核心修复：从整帧中提取【所有单个NALU】
+        std::vector<rtc::binary> nalus = splitAnnexBFrame(frame.data);
+        if (nalus.empty()) continue;
+
         uint32_t rtp_ts = static_cast<uint32_t>(frame.timestamp_us * 90 / 1000);
 
+        // 3. 复制客户端列表
         std::vector<std::shared_ptr<ClientTrackData>> clientsCopy;
         {
             std::lock_guard<std::mutex> lock(m_clientMutex);
             clientsCopy = m_clients;
         }
+        if (clientsCopy.empty()) continue;
 
-        if (clientsCopy.empty()) {
-            Log::debug("[MediaRouter] No connected clients, skip sending frame");
-            continue;
-        }
-
-        // 广播帧
-        for (auto& client : clientsCopy) {
-            try {
-                rtc::FrameInfo info(rtp_ts);
-                client->track->sendFrame(frame.data, info);
-                client->sender->rtpConfig->timestamp = rtp_ts;
-            } catch (const std::exception& e) {
-                Log::error("[MediaRouter] Failed to send frame to client: {}", e.what());
-            } catch (...) {
-                Log::error("[MediaRouter] Unknown error when sending frame to client");
+        // 4. ✅ 逐个发送【单个NALU】（符合RTP打包器要求）
+        for (const auto& nalu : nalus) {
+            for (auto& client : clientsCopy) {
+                try {
+                    rtc::FrameInfo info(rtp_ts);
+                    // 发送单个NALU ✅ 正确用法
+                    client->track->sendFrame(nalu, info);
+                    client->sender->rtpConfig->timestamp = rtp_ts;
+                } catch (const std::exception& e) {
+                    Log::error("[MediaRouter] Send NALU failed: {}", e.what());
+                }
             }
         }
     }
     Log::info("[MediaRouter] Sender loop exited");
 }
 
+// 新增：将Annex-B整帧拆分为单个NALU列表
+std::vector<rtc::binary> MediaRouter::splitAnnexBFrame(const rtc::binary& data) {
+    std::vector<rtc::binary> nalus;
+    if (data.size() < 4) return nalus;
+
+    std::vector<size_t> startCodes;
+    for (size_t i = 0; i < data.size() - 3; i++) {
+        if (data[i] == std::byte(0) && data[i+1] == std::byte(0) && 
+            data[i+2] == std::byte(0) && data[i+3] == std::byte(1)) {
+            startCodes.push_back(i);
+            i += 3;
+        } else if (data[i] == std::byte(0) && data[i+1] == std::byte(0) && 
+                   data[i+2] == std::byte(1)) {
+            startCodes.push_back(i);
+            i += 2;
+        }
+    }
+
+    for (size_t i = 0; i < startCodes.size(); i++) {
+        size_t start = startCodes[i];
+        size_t end = (i == startCodes.size()-1) ? data.size() : startCodes[i+1];
+        if (end - start > 0) {
+            nalus.emplace_back(data.begin() + start, data.begin() + end);
+        }
+    }
+    return nalus;
+}
+
 void MediaRouter::parseAndCache(const VideoFrame& frame) {
     const auto& data = frame.data;
-    if (data.size() < 5) {
-        Log::debug("[MediaRouter] Frame too small to parse NALU");
+    if (data.size() < 4) {
+        Log::debug("[MediaRouter] Frame too small to parse Annex-B NALU");
         return;
     }
 
-    size_t offset = 0;
-    while (offset + 4 <= data.size()) {
-        uint32_t size =
-            (static_cast<uint32_t>(data[offset])  << 24) |
-            (static_cast<uint32_t>(data[offset+1])<< 16) |
-            (static_cast<uint32_t>(data[offset+2])<< 8)  |
-            (static_cast<uint32_t>(data[offset+3]));
+    // Annex-B 起始码：0x000001 (3字节) 或 0x00000001 (4字节)
+    std::vector<size_t> startCodes;
+    for (size_t i = 0; i < data.size() - 3; i++) {
+        // 匹配 0x000001
+        if (data[i]   == std::byte(0x00) &&
+            data[i+1] == std::byte(0x00) &&
+            data[i+2] == std::byte(0x00) &&
+            data[i+3] == std::byte(0x01)) {
+            startCodes.push_back(i);
+            i += 3; // 跳过4字节起始码
+        }
+        // 匹配 0x000001
+        else if (data[i]   == std::byte(0x00) &&
+                 data[i+1] == std::byte(0x00) &&
+                 data[i+2] == std::byte(0x01)) {
+            startCodes.push_back(i);
+            i += 2; // 跳过3字节起始码
+        }
+    }
 
-        offset += 4;
-        if (offset + size > data.size()) break;
+    if (startCodes.empty()) {
+        Log::debug("[MediaRouter] No Annex-B start code found");
+        return;
+    }
 
-        const uint8_t* nalu = reinterpret_cast<const uint8_t*>(data.data() + offset);
+    // 遍历所有 NALU（Annex-B 格式，直接保留原始数据，无需Length前缀）
+    for (size_t i = 0; i < startCodes.size(); i++) {
+        size_t start = startCodes[i];
+        size_t end = (i == startCodes.size() - 1) ? data.size() : startCodes[i+1];
+        size_t naluSize = end - start;
+
+        if (naluSize < 1) continue;
+
+        // 提取 NALU 原始数据（包含起始码，符合Annex-B）
+        const uint8_t* nalu = reinterpret_cast<const uint8_t*>(data.data() + start);
         uint8_t nalType = nalu[0] & 0x1F;
 
-        rtc::binary singleNalu(4 + size);
-        singleNalu[0] = std::byte( (size >> 24) & 0xFF );
-        singleNalu[1] = std::byte( (size >> 16) & 0xFF );
-        singleNalu[2] = std::byte( (size >> 8)  & 0xFF );
-        singleNalu[3] = std::byte( size & 0xFF );
-        std::copy(nalu, nalu + size, reinterpret_cast<uint8_t*>(singleNalu.data() + 4));
+        // 直接缓存原始 Annex-B 数据（打包器会自动处理）
+        rtc::binary singleNalu(data.begin() + start, data.begin() + end);
 
-        // 缓存日志
+        // 缓存 SPS/PPS/IDR
         if (nalType == 7) {
             m_sps = singleNalu;
-            Log::info("[MediaRouter] Parsed and cached SPS (NAL type=7)");
+            Log::info("[MediaRouter] Parsed and cached SPS (Annex-B, NAL type=7)");
         }
         else if (nalType == 8) {
             m_pps = singleNalu;
-            Log::info("[MediaRouter] Parsed and cached PPS (NAL type=8)");
+            Log::info("[MediaRouter] Parsed and cached PPS (Annex-B, NAL type=8)");
         }
         else if (nalType == 5) {
             m_cachedIdr = singleNalu;
             m_cachedIdrTs = frame.timestamp_us;
-            Log::info("[MediaRouter] Parsed and cached IDR (NAL type=5), timestamp={} us", m_cachedIdrTs);
+            Log::info("[MediaRouter] Parsed and cached IDR (Annex-B, NAL type=5)");
         }
-
-        offset += size;
     }
 
-    // 拼接SPS+PPS
+    // 拼接 SPS+PPS 缓存
     if (!m_sps.empty() && !m_pps.empty() && m_cachedSpsPps.empty()) {
-        m_cachedSpsPps.clear();
-        m_cachedSpsPps.insert(m_cachedSpsPps.end(), m_sps.begin(), m_sps.end());
+        m_cachedSpsPps = m_sps;
         m_cachedSpsPps.insert(m_cachedSpsPps.end(), m_pps.begin(), m_pps.end());
-        Log::info("[MediaRouter] SPS + PPS combined and cached successfully");
+        Log::info("[MediaRouter] SPS + PPS combined (Annex-B)");
     }
 }

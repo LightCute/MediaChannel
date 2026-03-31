@@ -25,7 +25,7 @@ public:
 
 private:
     void senderLoop();
-
+    std::vector<rtc::binary> splitAnnexBFrame(const rtc::binary& data);
     void parseAndCache(const VideoFrame& frame);
 
 private:

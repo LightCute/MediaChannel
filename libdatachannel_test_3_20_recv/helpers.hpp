@@ -15,6 +15,8 @@
 #include <shared_mutex>
 
 #include "GstMediaPlayer.h"
+#include "MediaReceiver.h"
+
 struct ClientTrackData {
     std::shared_ptr<rtc::Track> track;
     std::shared_ptr<rtc::RtcpSrReporter> sender;
@@ -40,12 +42,9 @@ struct Client {
     std::optional<std::shared_ptr<ClientTrackData>> audio;
     
     // ------------------- 接收用（新增）-------------------
-    std::optional<std::shared_ptr<rtc::Track>> recvVideo;
-    std::optional<std::shared_ptr<rtc::Track>> recvAudio;
     std::optional<std::shared_ptr<rtc::DataChannel>> dataChannel;
 
-
-    std::shared_ptr<GstMediaPlayer> player;
+    std::shared_ptr<MediaReceiver> mediaReceiver;
 
     void setState(State state);
     State getState();
