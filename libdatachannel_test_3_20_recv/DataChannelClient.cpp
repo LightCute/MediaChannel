@@ -12,7 +12,7 @@ using nlohmann::json;
 DataChannelClient::DataChannelClient() 
     : m_MainThread("MainThread")
 {
-    Log::init("app.log", Log::Mode::Async, spdlog::level::trace);
+    Log::init("app_recv.log", Log::Mode::Async, spdlog::level::trace);
     Log::info("[DataChannelClient] Starting, thread id: [{}]", Log::threadIdToString(std::this_thread::get_id()));
     rtc::InitLogger(rtc::LogLevel::Debug, myCppLogCallback);
     m_localId = randomId(4);
