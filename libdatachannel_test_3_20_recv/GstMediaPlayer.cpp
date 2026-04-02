@@ -47,10 +47,10 @@ bool GstMediaPlayer::start() {
         "videoconvert ! autovideosink sync=false "
         
         // 音频支路
-        "appsrc name=audio_src emit-signals=false is-live=true ! "
-        "queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! "
-        "opusparse ! opusdec ! audioconvert ! audioresample ! autoaudiosink sync=false ";
-        
+        // "appsrc name=audio_src emit-signals=false is-live=true ! "
+        // "queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! "
+        // "opusparse ! opusdec ! audioconvert ! audioresample ! autoaudiosink sync=false ";
+        ;
     Log::debug("[GstMediaPlayer] Pipeline desc: {}", pipelineDesc);
 
     GError* error = nullptr;
@@ -67,10 +67,15 @@ bool GstMediaPlayer::start() {
     m_appsrcVideo = gst_bin_get_by_name(GST_BIN(m_pipeline), "video_src");
     m_appsrcAudio = gst_bin_get_by_name(GST_BIN(m_pipeline), "audio_src");
 
-    if (!m_appsrcVideo || !m_appsrcAudio) {
-        Log::error("[GstMediaPlayer] Failed to get appsrc (video={}, audio={})",
-            m_appsrcVideo != nullptr, m_appsrcAudio != nullptr);
+    // ✅ 只检查视频
+    if (!m_appsrcVideo) {
+        Log::error("[GstMediaPlayer] Failed to get video appsrc");
         return false;
+    }
+
+    // ✅ 音频允许为空
+    if (!m_appsrcAudio) {
+        Log::warn("[GstMediaPlayer] Audio appsrc not found (expected, audio disabled)");
     }
 
     Log::info("[GstMediaPlayer] AppSrc acquired successfully");
@@ -85,7 +90,7 @@ bool GstMediaPlayer::start() {
         "block", FALSE,   // 🔥关键
         "format", GST_FORMAT_TIME,
         nullptr);
-    gst_caps_unref(videoCaps);
+        
 
     // ===================== 设置音频 Caps =====================
     Log::info("[GstMediaPlayer] Setting audio caps: opus 48k stereo");
@@ -95,8 +100,10 @@ bool GstMediaPlayer::start() {
         "rate", G_TYPE_INT, 48000,
         nullptr
     );
+    g_object_set(m_appsrcVideo, "caps", videoCaps, nullptr);
     g_object_set(m_appsrcAudio, "caps", audioCaps, nullptr);
     gst_caps_unref(audioCaps);
+    gst_caps_unref(videoCaps);
 
     // ===================== 连接数据探针信号 =====================
     GstElement* probe1 = gst_bin_get_by_name(GST_BIN(m_pipeline), "probe1");
