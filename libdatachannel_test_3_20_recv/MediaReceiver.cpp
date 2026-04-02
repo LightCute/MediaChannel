@@ -55,7 +55,7 @@ void MediaReceiver::initTrackCallback(std::shared_ptr<rtc::Track> track, bool is
             m_player->pushVideoFrame(data, info.timestamp);
         } else {
             Log::info("[MediaReceiver] receive Opus Frame | size: {} bytes", data.size());
-            m_player->pushAudioFrame(data, info.timestamp);
+            //m_player->pushAudioFrame(data, info.timestamp);
         }
     });
 }

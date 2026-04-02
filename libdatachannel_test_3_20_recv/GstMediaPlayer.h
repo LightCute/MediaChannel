@@ -26,11 +26,8 @@ private:
     static void onHandoff(GstElement* identity, GstBuffer* buffer, gpointer user_data);
     // 总线消息回调
     static gboolean onGstMessage(GstBus* bus, GstMessage* msg, gpointer user_data);
-    // 内部推送函数
-    void pushToAppSrc(GstElement* appsrc, const rtc::binary& data, uint32_t timestamp, uint32_t clockRate);
     GstElement* m_pipeline;
     GstElement* m_appsrcVideo;
-    GstElement* m_appsrcAudio;
     
     std::atomic<bool> m_isRunning;
 };

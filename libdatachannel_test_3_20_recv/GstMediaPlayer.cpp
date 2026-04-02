@@ -11,7 +11,7 @@ const uint32_t VIDEO_CLOCK = 90000;
 static int frame_cnt = 0;
 
 GstMediaPlayer::GstMediaPlayer() 
-    : m_pipeline(nullptr), m_appsrcVideo(nullptr), m_appsrcAudio(nullptr), m_isRunning(false) {
+    : m_pipeline(nullptr), m_appsrcVideo(nullptr), m_isRunning(false) {
     gst_init(nullptr, nullptr);
     Log::info("[GstMediaPlayer] Constructor initialized, GStreamer inited");
 }
@@ -65,18 +65,12 @@ bool GstMediaPlayer::start() {
 
     // 获取 AppSrc
     m_appsrcVideo = gst_bin_get_by_name(GST_BIN(m_pipeline), "video_src");
-    m_appsrcAudio = gst_bin_get_by_name(GST_BIN(m_pipeline), "audio_src");
 
-    // ✅ 只检查视频
     if (!m_appsrcVideo) {
         Log::error("[GstMediaPlayer] Failed to get video appsrc");
         return false;
     }
 
-    // ✅ 音频允许为空
-    if (!m_appsrcAudio) {
-        Log::warn("[GstMediaPlayer] Audio appsrc not found (expected, audio disabled)");
-    }
 
     Log::info("[GstMediaPlayer] AppSrc acquired successfully");
 
@@ -92,17 +86,8 @@ bool GstMediaPlayer::start() {
         nullptr);
         
 
-    // ===================== 设置音频 Caps =====================
-    Log::info("[GstMediaPlayer] Setting audio caps: opus 48k stereo");
-    GstCaps* audioCaps = gst_caps_new_simple(
-        "audio/x-opus",
-        "channels", G_TYPE_INT, 2,
-        "rate", G_TYPE_INT, 48000,
-        nullptr
-    );
+
     g_object_set(m_appsrcVideo, "caps", videoCaps, nullptr);
-    g_object_set(m_appsrcAudio, "caps", audioCaps, nullptr);
-    gst_caps_unref(audioCaps);
     gst_caps_unref(videoCaps);
 
     // ===================== 连接数据探针信号 =====================
@@ -205,7 +190,6 @@ void GstMediaPlayer::stop() {
         gst_object_unref(m_pipeline);
         m_pipeline = nullptr;
         m_appsrcVideo = nullptr;
-        m_appsrcAudio = nullptr;
     }
 
     Log::info("[GstMediaPlayer] Stopped successfully");
@@ -233,19 +217,3 @@ void GstMediaPlayer::pushVideoFrame(rtc::binary data, uint32_t timestamp) {
     gst_buffer_unref(buf);
 }
 
-void GstMediaPlayer::pushAudioFrame(rtc::binary data, uint32_t timestamp) {
-    if (!m_isRunning || !m_appsrcAudio) return;
-    pushToAppSrc(m_appsrcAudio, data, timestamp, 48000);
-}
-
-// 增强版 数据推送函数（带完整日志）
-void GstMediaPlayer::pushToAppSrc(GstElement* appsrc, const rtc::binary& data, uint32_t ts, uint32_t clock) {
-    if (!appsrc || data.empty()) return;
-    GstBuffer* buf = gst_buffer_new_memdup(data.data(), data.size());
-    GST_BUFFER_PTS(buf) = (uint64_t)ts * GST_SECOND / clock;
-    GST_BUFFER_DTS(buf) = GST_BUFFER_PTS(buf);
-
-    GstFlowReturn ret;
-    g_signal_emit_by_name(appsrc, "push-buffer", buf, &ret);
-    gst_buffer_unref(buf);
-}
